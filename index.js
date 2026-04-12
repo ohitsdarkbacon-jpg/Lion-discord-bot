@@ -28,10 +28,21 @@ let slots = fs.existsSync(SLOTS_FILE) ? JSON.parse(fs.readFileSync(SLOTS_FILE)) 
 
 // ===== PROJECT CONFIG =====
 const PROJECTS = {
-  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: "Basic",   creditToHours: 0.5, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
-  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: "Premium", creditToHours: 1,   maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY }
+  1: { 
+    id: process.env.LUARMOR_PROJECT_ID_1, 
+    name: "Basic",   
+    creditToHours: 2,      // ← Changed to 2 hours per credit
+    maxSlots: 12, 
+    apiKey: process.env.LUARMOR_API_KEY 
+  },
+  2: { 
+    id: process.env.LUARMOR_PROJECT_ID_2, 
+    name: "Premium", 
+    creditToHours: 1,      // 1 hour per credit (kept as requested)
+    maxSlots: 6,  
+    apiKey: process.env.LUARMOR_API_KEY 
+  }
 };
-
 // ===== SAVE FUNCTIONS =====
 function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); }
 function saveSlots() { fs.writeFileSync(SLOTS_FILE, JSON.stringify(slots, null, 2)); }
@@ -137,20 +148,29 @@ function generateSlotsEmbed() {
 
 // ===== COMMAND HANDLER =====
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
+  if (interaction.isChatInputCommand() && interaction.commandName === 'panel' &&
+      process.env.ADMIN_IDS.split(',').includes(interaction.user.id)) {
 
-  if (interaction.commandName === 'panel' && process.env.ADMIN_IDS.split(',').includes(interaction.user.id)) {
     const embed = new EmbedBuilder()
       .setTitle('🔑 Slot System')
-      .setDescription('**Basic**: 1 Credit = 0.5 Hours (12 slots)\n**Premium**: 1 Credit = 1 Hour (6 slots)')
+      .setDescription('**Basic**: 1 Credit = **2 Hours** (12 slots)\n**Premium**: 1 Credit = **1 Hour** (6 slots)')
       .setColor(0x0099ff);
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('select_project_1').setLabel('Basic (0.5h)').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('select_project_2').setLabel('Premium (1h)').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('buy_crypto').setLabel('💳 Buy Credits').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('view_slots').setLabel('📊 Slots').setStyle(ButtonStyle.Secondary)
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('select_project_1').setLabel('Basic (2h)').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('select_project_2').setLabel('Premium (1h)').setStyle(ButtonStyle.Success)
     );
+
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('buy_crypto').setLabel('💳 Buy Credits').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('view_slots').setLabel('📊 View Slots').setStyle(ButtonStyle.Secondary)
+    );
+
+    await interaction.reply({ 
+      embeds: [embed, generateSlotsEmbed()], 
+      components: [row1, row2] 
+    });
+  }
 
     await interaction.reply({ embeds: [embed, generateSlotsEmbed()], components: [row] });
   }
