@@ -30,15 +30,15 @@ let slots = fs.existsSync(SLOTS_FILE) ? JSON.parse(fs.readFileSync(SLOTS_FILE)) 
 const PROJECTS = {
   1: { 
     id: process.env.LUARMOR_PROJECT_ID_1, 
-    name: "Lion Farmer",   
-    creditToHours: 2,      // 1 credit = 2 hours (unchanged)
+    name: "Basic",   
+    creditToHours: 2,      // ← Changed to 2 hours per credit
     maxSlots: 12, 
     apiKey: process.env.LUARMOR_API_KEY 
   },
   2: { 
     id: process.env.LUARMOR_PROJECT_ID_2, 
-    name: "Lion Main", 
-    creditToHours: 120,    // 1 credit = 5 days (5 * 24 hours)
+    name: "Premium", 
+    creditToHours: 1,      // 1 hour per credit (kept as requested)
     maxSlots: 6,  
     apiKey: process.env.LUARMOR_API_KEY 
   }
@@ -125,7 +125,7 @@ function generateSlotsEmbed() {
 
   const embed = new EmbedBuilder()
     .setTitle('🎟️ Global Slots')
-    .setDescription(`**Lion Farmer**: ${basicActive}/${PROJECTS[1].maxSlots} • **Lion Main**: ${premiumActive}/${PROJECTS[2].maxSlots}`)
+    .setDescription(`**Basic**: ${basicActive}/${PROJECTS[1].maxSlots} • **Premium**: ${premiumActive}/${PROJECTS[2].maxSlots}`)
     .setColor(0x0099ff);
 
   const now = Date.now();
@@ -155,12 +155,12 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'panel' && isAdmin) {
       const embed = new EmbedBuilder()
         .setTitle('🔑 Slot System')
-        .setDescription('**Lion Farmer**: 1 Credit = **2 Hours** (12 slots)\n**Lion Main**: 1 Credit = **5 Days** (6 slots)')
+        .setDescription('**Basic**: 1 Credit = **2 Hours** (12 slots)\n**Premium**: 1 Credit = **1 Hour** (6 slots)')
         .setColor(0x0099ff);
 
       const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('select_project_1').setLabel('Lion Farmer (2h)').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('select_project_2').setLabel('Lion Main (5 days)').setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId('select_project_1').setLabel('Basic (2h)').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('select_project_2').setLabel('Premium (1h)').setStyle(ButtonStyle.Success)
       );
 
       const row2 = new ActionRowBuilder().addComponents(
@@ -225,7 +225,7 @@ client.on('interactionCreate', async interaction => {
         new ActionRowBuilder().addComponents(
           new TextInputBuilder()
             .setCustomId('credits_amount')
-            .setLabel(`Credits to spend (1c = ${project.name === "Lion Farmer" ? "2h" : "5 days"})`)
+            .setLabel(`Credits to spend (1c = ${project.creditToHours}h)`)
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
         )
@@ -284,7 +284,7 @@ setInterval(async () => {
         const txs = res.data.txrefs || [];
         for (const tx of txs) {
           if (tx.confirmations >= 1 && !user.processed.includes(tx.tx_hash)) {
-            const credits = Math.floor(tx.value / 100000);
+            const credits = Math.floor(tx.value / 100000); // satoshis to credits (adjust if needed)
             if (credits > 0) {
               user.credits += credits;
               user.processed.push(tx.tx_hash);
