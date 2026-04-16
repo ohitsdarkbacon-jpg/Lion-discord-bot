@@ -28,21 +28,10 @@ let slots = fs.existsSync(SLOTS_FILE) ? JSON.parse(fs.readFileSync(SLOTS_FILE)) 
 
 // ===== PROJECT CONFIG =====
 const PROJECTS = {
-  1: { 
-    id: process.env.LUARMOR_PROJECT_ID_1, 
-    name: "Lion Farmer",   
-    creditToHours: 2,      // 1 credit = 2 hours (unchanged)
-    maxSlots: 12, 
-    apiKey: process.env.LUARMOR_API_KEY 
-  },
-  2: { 
-    id: process.env.LUARMOR_PROJECT_ID_2, 
-    name: "Lion Main", 
-    creditToHours: 120,    // 1 credit = 5 days (5 * 24 hours)
-    maxSlots: 6,  
-    apiKey: process.env.LUARMOR_API_KEY 
-  }
+  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: "Basic",   creditToHours: 2, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
+  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: "Premium", creditToHours: 1,   maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY }
 };
+
 // ===== SAVE FUNCTIONS =====
 function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); }
 function saveSlots() { fs.writeFileSync(SLOTS_FILE, JSON.stringify(slots, null, 2)); }
@@ -125,7 +114,7 @@ function generateSlotsEmbed() {
 
   const embed = new EmbedBuilder()
     .setTitle('🎟️ Global Slots')
-    .setDescription(`**Lion Farmer**: ${basicActive}/${PROJECTS[1].maxSlots} • **Lion Main**: ${premiumActive}/${PROJECTS[2].maxSlots}`)
+    .setDescription(`**Basic**: ${basicActive}/${PROJECTS[1].maxSlots} • **Premium**: ${premiumActive}/${PROJECTS[2].maxSlots}`)
     .setColor(0x0099ff);
 
   const now = Date.now();
@@ -146,124 +135,118 @@ function generateSlotsEmbed() {
   return embed;
 }
 
-// ===== SINGLE COMMAND + INTERACTION HANDLER =====
+// ===== COMMAND HANDLER =====
 client.on('interactionCreate', async interaction => {
-  // === Slash Commands ===
-  if (interaction.isChatInputCommand()) {
-    const isAdmin = process.env.ADMIN_IDS.split(',').includes(interaction.user.id);
+  if (!interaction.isChatInputCommand()) return;
 
-    if (interaction.commandName === 'panel' && isAdmin) {
-      const embed = new EmbedBuilder()
-        .setTitle('🔑 Slot System')
-        .setDescription('**Lion Farmer**: 1 Credit = **2 Hours** (12 slots)\n**Lion Main**: 1 Credit = **5 Days** (6 slots)')
-        .setColor(0x0099ff);
+  if (interaction.commandName === 'panel' && process.env.ADMIN_IDS.split(',').includes(interaction.user.id)) {
+    const embed = new EmbedBuilder()
+      .setTitle('🔑 Slot System')
+      .setDescription('**Basic**: 1 Credit = 2 Hours (12 slots)\n**Premium**: 1 Credit = 1 Hour (6 slots)')
+      .setColor(0x0099ff);
 
-      const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('select_project_1').setLabel('Lion Farmer (2h)').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('select_project_2').setLabel('Lion Main (5 days)').setStyle(ButtonStyle.Success)
-      );
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('select_project_1').setLabel('Basic (0.5h)').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('select_project_2').setLabel('Premium (1h)').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('buy_crypto').setLabel('💳 Buy Credits').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('view_slots').setLabel('📊 Slots').setStyle(ButtonStyle.Secondary)
+    );
 
-      const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('buy_crypto').setLabel('💳 Buy Credits').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('view_slots').setLabel('📊 View Slots').setStyle(ButtonStyle.Secondary)
-      );
-
-      return interaction.reply({ 
-        embeds: [embed, generateSlotsEmbed()], 
-        components: [row1, row2] 
-      });
-    }
-
-    if (interaction.commandName === 'givecredits' && isAdmin) {
-      const target = interaction.options.getUser('user');
-      const amount = interaction.options.getInteger('amount');
-      if (!users[target.id]) users[target.id] = { credits: 0, processed: [], btc: null, ltc: null };
-      users[target.id].credits += amount;
-      saveUsers();
-      return interaction.reply(`✅ Gave **${amount} credits** to ${target.tag}`);
-    }
+    await interaction.reply({ embeds: [embed, generateSlotsEmbed()], components: [row] });
   }
 
-  // === Button Handler ===
-  if (interaction.isButton()) {
-    const userId = interaction.user.id;
-    if (!users[userId]) users[userId] = { credits: 0, processed: [], btc: null, ltc: null };
-
-    if (interaction.customId === 'buy_crypto') {
-      try {
-        const btc = await axios.post('https://api.blockcypher.com/v1/btc/main/addrs', {}, { params: { token: process.env.BLOCKCYPHER_TOKEN } });
-        const ltc = await axios.post('https://api.blockcypher.com/v1/ltc/main/addrs', {}, { params: { token: process.env.BLOCKCYPHER_TOKEN } });
-
-        users[userId].btc = btc.data.address;
-        users[userId].ltc = ltc.data.address;
-        users[userId].processed = [];
-        saveUsers();
-
-        await interaction.reply({
-          content: `**💳 Your Payment Addresses**\n\n**BTC**: \`${users[userId].btc}\`\n**LTC**: \`${users[userId].ltc}\`\n\nSend any amount. Credits added automatically.`,
-          ephemeral: true
-        });
-      } catch (err) {
-        await interaction.reply({ content: '❌ Failed to generate addresses.', ephemeral: true });
-      }
-      return;
-    }
-
-    if (interaction.customId === 'view_slots') {
-      return interaction.reply({ embeds: [generateSlotsEmbed()], ephemeral: true });
-    }
-
-    if (['select_project_1', 'select_project_2'].includes(interaction.customId)) {
-      const num = interaction.customId === 'select_project_1' ? 1 : 2;
-      const project = PROJECTS[num];
-
-      const modal = new ModalBuilder()
-        .setCustomId(`activate_modal_${num}`)
-        .setTitle(`Activate ${project.name} Slot`);
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('credits_amount')
-            .setLabel(`Credits to spend (1c = ${project.name === "Lion Farmer" ? "2h" : "5 days"})`)
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-        )
-      );
-
-      return interaction.showModal(modal);
-    }
+  if (interaction.commandName === 'givecredits' && process.env.ADMIN_IDS.split(',').includes(interaction.user.id)) {
+    const target = interaction.options.getUser('user');
+    const amount = interaction.options.getInteger('amount');
+    if (!users[target.id]) users[target.id] = { credits: 0, processed: [], btc: null, ltc: null };
+    users[target.id].credits += amount;
+    saveUsers();
+    await interaction.reply(`✅ Gave **${amount} credits** to ${target.tag}`);
   }
+});
 
-  // === Modal Handler ===
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('activate_modal_')) {
-    const num = parseInt(interaction.customId.split('_')[2]);
-    const project = PROJECTS[num];
-    const creditsToSpend = parseInt(interaction.fields.getTextInputValue('credits_amount'));
+// ===== BUTTON HANDLER =====
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isButton()) return;
 
-    if (!creditsToSpend || creditsToSpend > (users[interaction.user.id]?.credits || 0))
-      return interaction.reply({ content: '❌ Invalid or insufficient credits!', ephemeral: true });
+  const userId = interaction.user.id;
+  if (!users[userId]) users[userId] = { credits: 0, processed: [], btc: null, ltc: null };
 
-    if (getActiveSlots(num) >= project.maxSlots)
-      return interaction.reply({ content: `❌ All ${project.name} slots are full! (Max ${project.maxSlots})`, ephemeral: true });
-
+  if (interaction.customId === 'buy_crypto') {
     try {
-      const { key, expiry } = await createLuarmorKey(creditsToSpend * project.creditToHours, interaction.user.id, project);
+      const btc = await axios.post('https://api.blockcypher.com/v1/btc/main/addrs', {}, { params: { token: process.env.BLOCKCYPHER_TOKEN } });
+      const ltc = await axios.post('https://api.blockcypher.com/v1/ltc/main/addrs', {}, { params: { token: process.env.BLOCKCYPHER_TOKEN } });
 
-      slots = slots.filter(s => s.userId !== interaction.user.id);
-      slots.push({ userId: interaction.user.id, key, expiry, project: project.name, projectNum: num });
-
-      users[interaction.user.id].credits -= creditsToSpend;
+      users[userId].btc = btc.data.address;
+      users[userId].ltc = ltc.data.address;
+      users[userId].processed = [];
       saveUsers();
-      saveSlots();
 
       await interaction.reply({
-        content: `✅ **${project.name} Slot Activated!**\n🔑 Key: ${key}\n⏳ Expires in: ${formatTime(expiry - Date.now())}`,
+        content: `**💳 Your Payment Addresses**\n\n**BTC**: \`${users[userId].btc}\`\n**LTC**: \`${users[userId].ltc}\`\n\nSend any amount. Credits added automatically.`,
         ephemeral: true
       });
     } catch (err) {
-      await interaction.reply({ content: `❌ Luarmor Error:\n\`\`\`${err.message.slice(0, 1800)}\`\`\``, ephemeral: true });
+      await interaction.reply({ content: '❌ Failed to generate addresses.', ephemeral: true });
     }
+  }
+
+  if (interaction.customId === 'view_slots') {
+    return interaction.reply({ embeds: [generateSlotsEmbed()], ephemeral: true });
+  }
+
+  if (['select_project_1', 'select_project_2'].includes(interaction.customId)) {
+    const num = interaction.customId === 'select_project_1' ? 1 : 2;
+    const project = PROJECTS[num];
+
+    const modal = new ModalBuilder()
+      .setCustomId(`activate_modal_${num}`)
+      .setTitle(`Activate ${project.name} Slot`);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('credits_amount')
+          .setLabel(`Credits to spend (1c = ${project.creditToHours}h)`)
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+      )
+    );
+
+    return interaction.showModal(modal);
+  }
+});
+
+// ===== MODAL HANDLER =====
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isModalSubmit() || !interaction.customId.startsWith('activate_modal_')) return;
+
+  const num = parseInt(interaction.customId.split('_')[2]);
+  const project = PROJECTS[num];
+  const creditsToSpend = parseInt(interaction.fields.getTextInputValue('credits_amount'));
+
+  if (!creditsToSpend || creditsToSpend > users[interaction.user.id].credits)
+    return interaction.reply({ content: '❌ Invalid or insufficient credits!', ephemeral: true });
+
+  if (getActiveSlots(num) >= project.maxSlots)
+    return interaction.reply({ content: `❌ All ${project.name} slots are full! (Max ${project.maxSlots})`, ephemeral: true });
+
+  try {
+    const { key, expiry } = await createLuarmorKey(creditsToSpend * project.creditToHours, interaction.user.id, project);
+
+    slots = slots.filter(s => s.userId !== interaction.user.id);
+    slots.push({ userId: interaction.user.id, key, expiry, project: project.name, projectNum: num });
+
+    users[interaction.user.id].credits -= creditsToSpend;
+    saveUsers();
+    saveSlots();
+
+    await interaction.reply({
+      content: `✅ **${project.name} Slot Activated!**\n🔑 Key: ${key}\n⏳ Expires in: ${formatTime(expiry - Date.now())}`,
+      ephemeral: true
+    });
+  } catch (err) {
+    await interaction.reply({ content: `❌ Luarmor Error:\n\`\`\`${err.message.slice(0, 1800)}\`\`\``, ephemeral: true });
   }
 });
 
@@ -292,9 +275,7 @@ setInterval(async () => {
             }
           }
         }
-      } catch (e) {
-        // Silent fail as before
-      }
+      } catch {}
     }
   }
   saveUsers();
