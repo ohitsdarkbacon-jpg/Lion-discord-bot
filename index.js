@@ -34,8 +34,6 @@ let auctions = fs.existsSync(AUCTIONS_FILE) ? JSON.parse(fs.readFileSync(AUCTION
 let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
 
 // ===== PROJECT CONFIG =====
-// creditToHours: how many hours 1 credit gives
-// $1 = 1 credit
 const PROJECTS = {
 1: { id: process.env.LUARMOR_PROJECT_ID_1, name: ‘Basic’, creditToHours: 2, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
 2: { id: process.env.LUARMOR_PROJECT_ID_2, name: ‘Premium’, creditToHours: 1, maxSlots: 6, apiKey: process.env.LUARMOR_API_KEY },
@@ -43,10 +41,8 @@ const PROJECTS = {
 4: { id: process.env.LUARMOR_PROJECT_ID_4, name: ‘Main’, creditToHours: 1, maxSlots: 2, apiKey: process.env.LUARMOR_API_KEY },
 };
 
-// Projects 3 & 4 use the auction system
 const AUCTION_PROJECTS = [3, 4];
 const BID_SLOTS = 2;
-// Default auction duration when first bid is placed (minutes)
 const AUCTION_DURATION_MINS = 5;
 
 // ===== SAVE FUNCTIONS =====
@@ -64,7 +60,6 @@ new SlashCommandBuilder()
 .setDescription(‘Give credits to a user ($1 = 1 credit)’)
 .addUserOption(opt => opt.setName(‘user’).setDescription(‘User’).setRequired(true))
 .addIntegerOption(opt => opt.setName(‘amount’).setDescription(‘Amount of credits’).setRequired(true)),
-// /startauction is removed — auctions now start automatically on first bid
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: ‘10’ }).setToken(process.env.BOT_TOKEN);
@@ -78,10 +73,7 @@ console.log(‘✅ Commands registered’);
 }
 
 // ===== USER IDENTIFIER =====
-// Generates a stable unique identifier for a user based on their Discord username.
-// This is stored in Luarmor as the “identifier” field so keys are tied to the user.
 function getUserIdentifier(userId, username) {
-// Use a deterministic hash of userId + username so it never changes per user
 return crypto.createHash(‘sha256’).update(`${userId}:${username}`).digest(‘hex’).slice(0, 32);
 }
 
@@ -94,7 +86,7 @@ const res = await axios.post(
 `https://api.luarmor.net/v3/projects/${project.id}/users`,
 {
 discord_id: discordId,
-identifier, // stable per-user identifier based on username
+identifier,
 auth_expire: expiryUnix,
 note: `${username} (${discordId})`
 },
@@ -102,7 +94,6 @@ note: `${username} (${discordId})`
 );
 
 ```
-// Recursively find the user_key in the response
 const findKey = obj => {
 if (typeof obj === 'string' && /^[A-Za-z0-9]{6,}$/.test(obj)) return obj;
 if (typeof obj === 'object' && obj) {
@@ -205,8 +196,7 @@ embed.addFields({ name: `${icon} ${proj.name} (${active.length}/${proj.maxSlots}
 return embed;
 }
 
-// ===== AUCTION EMBEDS =====
-// These are always shown in the panel — “Waiting for first bid” when idle.
+// ===== AUCTION EMBED =====
 function generateAuctionSectionEmbed() {
 const now = Date.now();
 const embed = new EmbedBuilder()
@@ -238,7 +228,6 @@ statusLine = '🔴 **Live**';
 topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids yet';
 timeLine = `${mins}m ${secs}s`;
 } else {
-// ended
 const top = getTopBid(auction);
 statusLine = '✅ **Ended**';
 topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids';
@@ -316,7 +305,6 @@ if (!auction?.bids?.length) return null;
 return auction.bids.reduce((a, b) => (a.amount >= b.amount ? a : b));
 }
 
-// Ensures an auction entry exists in idle state
 function ensureAuction(projectNum, slotIndex) {
 const aId = getAuctionId(projectNum, slotIndex);
 if (!auctions[aId]) {
@@ -325,7 +313,7 @@ projectNum,
 slotIndex,
 endsAt: null,
 bids: [],
-status: ‘idle’ // idle → live → ended → idle (resets after ended)
+status: ‘idle’
 };
 saveAuctions();
 }
@@ -343,7 +331,6 @@ await updatePanelMessage();
 
 if (!topBid) {
 console.log(`⚠️ Auction ${auctionId} ended with no bids — resetting to idle.`);
-// Reset to idle so it can be bid on again
 setTimeout(() => {
 if (auctions[auctionId]) {
 auctions[auctionId] = { …auctions[auctionId], status: ‘idle’, bids: [], endsAt: null };
@@ -363,7 +350,6 @@ try {
 const channel = await client.channels.fetch(panelState.channelId);
 await channel.send(`⚠️ <@${topBid.userId}> won **${auctionId}** but has insufficient credits. Slot not activated.`);
 } catch {}
-// Reset auction to idle
 setTimeout(() => {
 auctions[auctionId] = { …auctions[auctionId], status: ‘idle’, bids: [], endsAt: null };
 saveAuctions();
@@ -373,7 +359,6 @@ return;
 }
 
 try {
-// Fetch Discord username for identifier generation
 let username = topBid.userId;
 try {
 const discordUser = await client.users.fetch(topBid.userId);
@@ -390,7 +375,6 @@ users[topBid.userId].credits -= topBid.amount;
 saveUsers();
 saveSlots();
 
-// DM winner
 try {
 const discordUser = await client.users.fetch(topBid.userId);
 await discordUser.send({
@@ -409,7 +393,6 @@ new EmbedBuilder()
 });
 } catch {}
 
-// DM losing bidders — refund credits
 for (const bid of auction.bids) {
 if (bid.userId === topBid.userId) continue;
 ensureUser(bid.userId);
@@ -429,7 +412,6 @@ new EmbedBuilder()
 saveUsers();
 console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits.`);
 
-// Reset auction to idle after a short delay so it can run again
 setTimeout(() => {
 auctions[auctionId] = { ...auctions[auctionId], status: 'idle', bids: [], endsAt: null };
 saveAuctions();
@@ -447,9 +429,7 @@ client.on(‘interactionCreate’, async interaction => {
 if (!interaction.isChatInputCommand()) return;
 const isAdmin = (process.env.ADMIN_IDS || ‘’).split(’,’).includes(interaction.user.id);
 
-// /panel
 if (interaction.commandName === ‘panel’ && isAdmin) {
-// Ensure all auction slots exist in idle state
 for (const num of AUCTION_PROJECTS) {
 for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
 }
@@ -463,7 +443,6 @@ savePanelState();
 return;
 }
 
-// /bidpanel — shows auction status to admin
 if (interaction.commandName === ‘bidpanel’ && isAdmin) {
 const lines = [];
 for (const num of AUCTION_PROJECTS) {
@@ -486,7 +465,6 @@ ephemeral: true
 });
 }
 
-// /givecredits ($1 = 1 credit)
 if (interaction.commandName === ‘givecredits’ && isAdmin) {
 const target = interaction.options.getUser(‘user’);
 const amount = interaction.options.getInteger(‘amount’);
@@ -494,7 +472,7 @@ ensureUser(target.id);
 users[target.id].credits += amount;
 saveUsers();
 return interaction.reply({
-content: `✅ Gave **${amount} credits** (\$${amount}) to ${target.tag}. Balance: **${users[target.id].credits}**`
+content: `✅ Gave **${amount} credits** ($${amount}) to ${target.tag}. Balance: **${users[target.id].credits}**`
 });
 }
 });
@@ -505,7 +483,6 @@ if (!interaction.isButton()) return;
 const userId = interaction.user.id;
 ensureUser(userId);
 
-// ── Buy crypto ──
 if (interaction.customId === ‘buy_crypto’) {
 const btcAddress = process.env.BTC_ADDRESS;
 const ltcAddress = process.env.LTC_ADDRESS;
@@ -541,12 +518,10 @@ return interaction.editReply({ content: ‘❌ Failed to generate QR codes.’ }
 }
 }
 
-// ── View slots ──
 if (interaction.customId === ‘view_slots’) {
 return interaction.reply({ embeds: [generateSlotsEmbed()], ephemeral: true });
 }
 
-// ── Select project (Basic/Premium) ──
 if ([‘select_project_1’, ‘select_project_2’].includes(interaction.customId)) {
 const num = interaction.customId === ‘select_project_1’ ? 1 : 2;
 const project = PROJECTS[num];
@@ -584,13 +559,10 @@ return interaction.showModal(modal);
 
 }
 
-// ── Place bid ──
 if (interaction.customId.startsWith(‘place_bid_’)) {
 const auctionId = interaction.customId.replace(‘place_bid_’, ‘’);
-ensureAuction(
-parseInt(auctionId.split(’*’)[1]),
-parseInt(auctionId.split(’*’)[2])
-);
+const parts = auctionId.split(’_’);
+ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
 const auction = auctions[auctionId];
 
 ```
@@ -626,7 +598,6 @@ if (!interaction.isModalSubmit()) return;
 const userId = interaction.user.id;
 ensureUser(userId);
 
-// ── Activate Basic/Premium slot ──
 if (interaction.customId.startsWith(‘activate_modal_’)) {
 const num = parseInt(interaction.customId.split(’_’)[2]);
 const project = PROJECTS[num];
@@ -681,13 +652,10 @@ ephemeral: true
 
 }
 
-// ── Bid modal ──
 if (interaction.customId.startsWith(‘bid_modal_’)) {
 const auctionId = interaction.customId.replace(‘bid_modal_’, ‘’);
-ensureAuction(
-parseInt(auctionId.split(’*’)[1]),
-parseInt(auctionId.split(’*’)[2])
-);
+const parts = auctionId.split(’_’);
+ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
 const auction = auctions[auctionId];
 
 ```
@@ -710,7 +678,6 @@ if (bidAmount > users[userId].credits) {
 return interaction.reply({ content: `❌ You only have **${users[userId].credits} credits**.`, ephemeral: true });
 }
 
-// ── Start auction timer on FIRST bid ──
 const isFirstBid = auction.status === 'idle';
 if (isFirstBid) {
 auction.status = 'live';
@@ -719,11 +686,9 @@ setTimeout(() => endAuction(auctionId), AUCTION_DURATION_MINS * 60 * 1000);
 console.log(`⏰ Auction ${auctionId} started by first bid from ${userId}`);
 }
 
-// Replace previous bid by this user (no stacking)
 auction.bids = auction.bids.filter(b => b.userId !== userId);
 auction.bids.push({ userId, amount: bidAmount });
 
-// Sniping protection: extend to 1 min if bid placed in last minute
 const timeLeft = auction.endsAt - Date.now();
 if (timeLeft < 60_000) {
 auction.endsAt = Date.now() + 60_000;
@@ -762,7 +727,6 @@ if (auction.status !== ‘live’) continue;
 if (auction.endsAt <= Date.now()) {
 endAuction(auctionId);
 } else {
-// Just refresh panel to update countdown
 updatePanelMessage();
 }
 }
@@ -773,12 +737,10 @@ client.once(‘ready’, async () => {
 console.log(`✅ Logged in as ${client.user.tag}`);
 await registerCommands();
 
-// Ensure all auction slots exist
 for (const num of AUCTION_PROJECTS) {
 for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
 }
 
-// Resume any live auctions that survived a restart
 for (const [auctionId, auction] of Object.entries(auctions)) {
 if (auction.status !== ‘live’) continue;
 const remaining = auction.endsAt - Date.now();
@@ -790,7 +752,6 @@ console.log(`⏰ Resuming auction ${auctionId} — ends in ${Math.ceil(remaining
 }
 }
 
-// Log outbound IP (useful for Luarmor whitelisting)
 https.get(‘https://api.ipify.org?format=json’, res => {
 let data = ‘’;
 res.on(‘data’, chunk => data += chunk);
@@ -801,4 +762,3 @@ try { console.log(‘🌐 Outbound IP:’, JSON.parse(data).ip); } catch {}
 });
 
 client.login(process.env.BOT_TOKEN);
- 
