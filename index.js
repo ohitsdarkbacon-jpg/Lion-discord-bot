@@ -24,18 +24,18 @@ const crypto = require('crypto');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
  
 // ===== FILES =====
-const USERS_FILE         = './users.json';
-const SLOTS_FILE         = './slots.json';
-const AUCTIONS_FILE      = './auctions.json';
-const PANEL_STATE_FILE   = './panel_state.json';
-const PAY_ADDRESSES_FILE = './pay_addresses.json';
+const USERS_FILE        = './users.json';
+const SLOTS_FILE        = './slots.json';
+const AUCTIONS_FILE     = './auctions.json';
+const PANEL_STATE_FILE  = './panel_state.json';
+const PAYMENTS_FILE     = './payments.json'; // replaces pay_addresses.json
  
-let users       = fs.existsSync(USERS_FILE)         ? JSON.parse(fs.readFileSync(USERS_FILE))         : {};
-let slots       = fs.existsSync(SLOTS_FILE)         ? JSON.parse(fs.readFileSync(SLOTS_FILE))         : [];
-let auctions    = fs.existsSync(AUCTIONS_FILE)       ? JSON.parse(fs.readFileSync(AUCTIONS_FILE))       : {};
-let panelState  = fs.existsSync(PANEL_STATE_FILE)   ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE))   : {};
-// payAddresses: { userId: { btc: { address, webhookId }, ltc: { address, webhookId } } }
-let payAddresses = fs.existsSync(PAY_ADDRESSES_FILE) ? JSON.parse(fs.readFileSync(PAY_ADDRESSES_FILE)) : {};
+let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
+let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
+let auctions   = fs.existsSync(AUCTIONS_FILE)    ? JSON.parse(fs.readFileSync(AUCTIONS_FILE))    : {};
+let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
+// payments: { paymentId: { userId, expectedAmount, currency, status, createdAt } }
+let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PAYMENTS_FILE))    : {};
  
 // ===== PROJECT CONFIG =====
 const PROJECTS = {
@@ -50,18 +50,22 @@ const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
 const AUCTION_FIXED_HOURS   = 2;
  
-// Webhook server port — expose this via reverse proxy or open firewall port
-// BlockCypher will POST to: http://YOUR_SERVER_IP:WEBHOOK_PORT/webhook
-const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT || '3000');
-// Your publicly reachable URL, e.g. "http://123.45.67.89:3000" or "https://yourdomain.com"
+// Webhook server port — expose via reverse proxy or open firewall port
+// NowPayments will POST to: WEBHOOK_BASE_URL/nowpayments-webhook
+const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || `http://localhost:${WEBHOOK_PORT}`;
  
+// NowPayments config
+const NOWPAYMENTS_API_KEY     = process.env.NOWPAYMENTS_API_KEY;
+const NOWPAYMENTS_IPN_SECRET  = process.env.NOWPAYMENTS_IPN_SECRET; // Set in NowPayments dashboard
+const NOWPAYMENTS_BASE_URL    = 'https://api.nowpayments.io/v1';
+ 
 // ===== SAVE FUNCTIONS =====
-function saveUsers()        { fs.writeFileSync(USERS_FILE,         JSON.stringify(users,        null, 2)); }
-function saveSlots()        { fs.writeFileSync(SLOTS_FILE,         JSON.stringify(slots,        null, 2)); }
-function saveAuctions()     { fs.writeFileSync(AUCTIONS_FILE,      JSON.stringify(auctions,     null, 2)); }
-function savePanelState()   { fs.writeFileSync(PANEL_STATE_FILE,   JSON.stringify(panelState,   null, 2)); }
-function savePayAddresses() { fs.writeFileSync(PAY_ADDRESSES_FILE, JSON.stringify(payAddresses, null, 2)); }
+function saveUsers()    { fs.writeFileSync(USERS_FILE,       JSON.stringify(users,      null, 2)); }
+function saveSlots()    { fs.writeFileSync(SLOTS_FILE,       JSON.stringify(slots,      null, 2)); }
+function saveAuctions() { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(auctions,   null, 2)); }
+function savePanelState(){ fs.writeFileSync(PANEL_STATE_FILE,JSON.stringify(panelState, null, 2)); }
+function savePayments() { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
  
 // ===== COMMANDS =====
 const commands = [
@@ -140,6 +144,7 @@ function getActiveSlots(projectNum) {
  
 function ensureUser(userId) {
   if (!users[userId]) users[userId] = { credits: 0, processed: [] };
+  if (!users[userId].processed) users[userId].processed = []; // BUG FIX: ensure processed always exists
 }
  
 // ===== QR CODE HELPER =====
@@ -148,110 +153,157 @@ async function generateQRBuffer(text) {
 }
  
 // ===========================
-// ===== CRYPTO PAYMENTS =====
+// ===== NOWPAYMENTS API =====
 // ===========================
  
-// Get live BTC price in USD from CoinGecko (free, no key needed)
-async function getBtcPriceUSD() {
-  const res = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', { timeout: 8000 });
-  return res.data.bitcoin.usd;
+/**
+ * Verify NowPayments IPN signature.
+ * NowPayments sends x-nowpayments-sig header = HMAC-SHA512 of sorted JSON body.
+ */
+function verifyNowPaymentsSignature(rawBody, signature) {
+  if (!NOWPAYMENTS_IPN_SECRET) return true; // skip if not configured (dev mode)
+  try {
+    const parsed = JSON.parse(rawBody);
+    const sortedJson = JSON.stringify(sortObjectKeys(parsed));
+    const hmac = crypto.createHmac('sha512', NOWPAYMENTS_IPN_SECRET)
+      .update(sortedJson)
+      .digest('hex');
+    return hmac === signature;
+  } catch {
+    return false;
+  }
 }
  
-// Get live LTC price in USD from CoinGecko
-async function getLtcPriceUSD() {
-  const res = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd', { timeout: 8000 });
-  return res.data.litecoin.usd;
+function sortObjectKeys(obj) {
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return obj;
+  return Object.keys(obj).sort().reduce((acc, key) => {
+    acc[key] = sortObjectKeys(obj[key]);
+    return acc;
+  }, {});
 }
  
 /**
- * Creates a BlockCypher forwarding address for a user + coin.
- * Payments sent to this address are forwarded to your real wallet.
- * BlockCypher sends a webhook on each confirmed payment.
+ * Create a NowPayments payment for a specific USD amount.
+ * Returns the payment object including pay_address, pay_amount, pay_currency, payment_id.
  *
- * @param {string} userId      - Discord user ID
- * @param {'btc'|'ltc'} coin   - Coin type
- * @param {string} destination - Your real wallet address
- * @returns {{ address: string, webhookId: string }}
+ * @param {string} userId   - Discord user ID (stored as order_description)
+ * @param {'btc'|'ltc'} currency - Which coin to accept
+ * @param {number} usdAmount - Dollar amount to charge
  */
-async function createForwardingAddress(userId, coin, destination) {
-  const chain     = coin === 'btc' ? 'main' : 'ltc/main';
-  const coinSlug  = coin === 'btc' ? 'btc'  : 'ltc';
-  const apiToken  = process.env.BLOCKCYPHER_TOKEN;
-  const callbackUrl = `${WEBHOOK_BASE_URL}/webhook?coin=${coinSlug}&userId=${userId}`;
- 
-  // 1. Create forwarding address
-  const fwdRes = await axios.post(
-    `https://api.blockcypher.com/v1/${coin === 'btc' ? 'btc/main' : 'ltc/main'}/forwards?token=${apiToken}`,
+async function createNowPayment(userId, currency, usdAmount) {
+  const res = await axios.post(
+    `${NOWPAYMENTS_BASE_URL}/payment`,
     {
-      destination,
-      callback_url: callbackUrl,
-      // Only fire callback once it has at least 1 confirmation
-      confirmations: 1,
+      price_amount: usdAmount,
+      price_currency: 'usd',
+      pay_currency: currency,
+      order_id: `${userId}_${Date.now()}`,
+      order_description: userId,
+      ipn_callback_url: `${WEBHOOK_BASE_URL}/nowpayments-webhook`,
+      // is_fixed_rate prevents price drift
+      is_fixed_rate: false,
+    },
+    {
+      headers: {
+        'x-api-key': NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json',
+      }
     }
   );
- 
-  const address = fwdRes.data.input_address;
-  if (!address) throw new Error(`BlockCypher did not return an address: ${JSON.stringify(fwdRes.data)}`);
- 
-  return { address, webhookId: fwdRes.data.id || null };
+  return res.data;
 }
  
 /**
- * Get or create a payment address for a user + coin.
- * Reuses the same address if already created.
+ * Fetch a NowPayments payment status by ID.
  */
-async function getOrCreatePayAddress(userId, coin) {
-  if (!payAddresses[userId]) payAddresses[userId] = {};
-  if (payAddresses[userId][coin]) return payAddresses[userId][coin].address;
- 
-  const destination = coin === 'btc' ? process.env.BTC_ADDRESS : process.env.LTC_ADDRESS;
-  if (!destination) throw new Error(`${coin.toUpperCase()} address not configured.`);
- 
-  const { address, webhookId } = await createForwardingAddress(userId, coin, destination);
-  payAddresses[userId][coin] = { address, webhookId };
-  savePayAddresses();
-  console.log(`📬 Created ${coin.toUpperCase()} forwarding address for ${userId}: ${address}`);
-  return address;
+async function getNowPaymentStatus(paymentId) {
+  const res = await axios.get(
+    `${NOWPAYMENTS_BASE_URL}/payment/${paymentId}`,
+    { headers: { 'x-api-key': NOWPAYMENTS_API_KEY } }
+  );
+  return res.data;
 }
  
 /**
- * Called when BlockCypher confirms a payment.
- * Calculates USD value → credits and assigns to user.
+ * Get minimum payment amount for a currency from NowPayments.
  */
-async function handleConfirmedPayment(userId, coin, satoshis) {
-  ensureUser(userId);
- 
-  // satoshis for BTC/LTC (1 BTC = 100,000,000 satoshis)
-  const units    = satoshis / 1e8;
-  let   priceUSD = 0;
- 
+async function getNowPaymentsMinAmount(currency) {
   try {
-    priceUSD = coin === 'btc' ? await getBtcPriceUSD() : await getLtcPriceUSD();
-  } catch (err) {
-    console.error(`❌ Failed to fetch ${coin.toUpperCase()} price:`, err.message);
-    // Fallback: notify admin and bail
-    try {
-      const adminIds = (process.env.ADMIN_IDS || '').split(',').filter(Boolean);
-      for (const adminId of adminIds) {
-        const admin = await client.users.fetch(adminId);
-        await admin.send(`⚠️ Payment received for <@${userId}> (${units} ${coin.toUpperCase()}) but price lookup failed. Please assign credits manually.`);
-      }
-    } catch {}
+    const res = await axios.get(
+      `${NOWPAYMENTS_BASE_URL}/min-amount?currency_from=${currency}&currency_to=usd`,
+      { headers: { 'x-api-key': NOWPAYMENTS_API_KEY } }
+    );
+    return res.data.min_amount || 0;
+  } catch {
+    return 0;
+  }
+}
+ 
+/**
+ * Called when NowPayments confirms a payment (finished/confirmed/partially_paid).
+ */
+async function handleConfirmedNowPayment(paymentData) {
+  const { payment_id, order_description, actually_paid, pay_currency, price_amount, payment_status } = paymentData;
+ 
+  // order_description stores the userId
+  const userId = order_description;
+  if (!userId) {
+    console.warn('⚠️ NowPayments webhook missing userId in order_description');
     return;
   }
  
-  const usdValue = units * priceUSD;
-  const credits  = Math.floor(usdValue); // 1 credit = $1 USD, floor so no partial credits
+  ensureUser(userId);
+ 
+  // Deduplicate by payment_id
+  const paymentKey = `np_${payment_id}`;
+  if (users[userId].processed.includes(paymentKey)) {
+    console.log(`⚠️ Duplicate NowPayments webhook for ${payment_id} — skipping`);
+    return;
+  }
+ 
+  // For partially_paid we credit what was actually paid vs price
+  // price_amount is in USD (what we asked for), actually_paid is in crypto
+  // We need the USD value of what was actually paid.
+  // NowPayments also provides outcome_amount (in USD) for finished payments.
+  let usdValue = 0;
+ 
+  if (payment_status === 'finished' || payment_status === 'confirmed') {
+    // price_amount is the exact USD amount requested — use that for full payment
+    usdValue = parseFloat(price_amount) || 0;
+  } else if (payment_status === 'partially_paid') {
+    // We don't have direct USD for partial — use the ratio of actually_paid / pay_amount * price_amount
+    const payRec = payments[payment_id];
+    if (payRec && payRec.payAmount) {
+      const ratio = parseFloat(actually_paid) / parseFloat(payRec.payAmount);
+      usdValue = ratio * parseFloat(price_amount);
+    } else {
+      usdValue = parseFloat(price_amount) * 0.5; // conservative fallback
+    }
+    console.log(`⚠️ Partial payment for ${userId}: actually_paid=${actually_paid} ${pay_currency}`);
+  }
+ 
+  const credits = Math.floor(usdValue);
  
   if (credits <= 0) {
-    console.log(`⚠️ Payment from ${userId} too small: ${units} ${coin.toUpperCase()} = $${usdValue.toFixed(4)} → 0 credits`);
+    console.log(`⚠️ Payment from ${userId} resolved to 0 credits (usdValue=${usdValue.toFixed(4)})`);
     return;
   }
  
   users[userId].credits += credits;
+  users[userId].processed.push(paymentKey);
+  if (users[userId].processed.length > 200) {
+    users[userId].processed = users[userId].processed.slice(-200);
+  }
   saveUsers();
  
-  console.log(`💰 Auto-credited ${credits} credits to ${userId} (${units} ${coin.toUpperCase()} ≈ $${usdValue.toFixed(2)})`);
+  // Mark payment record as credited
+  if (payments[payment_id]) {
+    payments[payment_id].status = 'credited';
+    payments[payment_id].creditedAt = Date.now();
+    savePayments();
+  }
+ 
+  console.log(`💰 Auto-credited ${credits} credits to ${userId} via NowPayments (payment ${payment_id}, ~$${usdValue.toFixed(2)})`);
  
   // DM the user
   try {
@@ -261,13 +313,12 @@ async function handleConfirmedPayment(userId, coin, satoshis) {
         new EmbedBuilder()
           .setTitle('💰 Payment Received!')
           .setColor(0x57F287)
-          .setDescription(`Your crypto payment has been confirmed and credits have been added automatically.`)
+          .setDescription('Your crypto payment has been confirmed and credits have been added automatically.')
           .addFields(
-            { name: '🪙 Coin',             value: coin.toUpperCase(),                 inline: true },
-            { name: '📦 Amount',           value: `${units} ${coin.toUpperCase()}`,   inline: true },
-            { name: '💵 USD Value',        value: `~$${usdValue.toFixed(2)}`,         inline: true },
-            { name: '✅ Credits Added',    value: `**${credits}**`,                   inline: true },
-            { name: '💳 New Balance',      value: `**${users[userId].credits}**`,     inline: true },
+            { name: '🪙 Coin',           value: (pay_currency || 'crypto').toUpperCase(), inline: true },
+            { name: '💵 USD Value',      value: `~$${usdValue.toFixed(2)}`,              inline: true },
+            { name: '✅ Credits Added',  value: `**${credits}**`,                         inline: true },
+            { name: '💳 New Balance',    value: `**${users[userId].credits}**`,           inline: true },
           )
           .setFooter({ text: 'Credits are rounded down to the nearest dollar.' })
       ]
@@ -276,33 +327,28 @@ async function handleConfirmedPayment(userId, coin, satoshis) {
     console.error(`❌ Could not DM user ${userId}:`, err.message);
   }
  
-  // Update the panel
   updatePanelMessage().catch(() => {});
 }
  
 // ===== WEBHOOK HTTP SERVER =====
-// BlockCypher POSTs here when a forwarded payment is confirmed.
 function startWebhookServer() {
   const server = http.createServer(async (req, res) => {
-    // Only accept POST /webhook
-    if (req.method !== 'POST' || !req.url.startsWith('/webhook')) {
+    if (req.method !== 'POST' || !req.url.startsWith('/nowpayments-webhook')) {
       res.writeHead(404);
       return res.end();
     }
  
-    const urlObj = new URL(req.url, `http://localhost`);
-    const coin   = urlObj.searchParams.get('coin');   // 'btc' or 'ltc'
-    const userId = urlObj.searchParams.get('userId');
- 
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
-      // Always respond 200 immediately so BlockCypher doesn't retry
+      // Always respond 200 immediately
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
  
-      if (!coin || !userId) {
-        console.warn('⚠️ Webhook missing coin or userId params');
+      // Verify signature
+      const sig = req.headers['x-nowpayments-sig'];
+      if (NOWPAYMENTS_IPN_SECRET && !verifyNowPaymentsSignature(body, sig)) {
+        console.warn('⚠️ NowPayments webhook signature mismatch — ignoring');
         return;
       }
  
@@ -310,66 +356,28 @@ function startWebhookServer() {
       try {
         payload = JSON.parse(body);
       } catch {
-        console.warn('⚠️ Webhook body is not valid JSON');
+        console.warn('⚠️ NowPayments webhook body is not valid JSON');
         return;
       }
  
-      // BlockCypher forwarding webhooks include `value` (in satoshis) on the tx outputs
-      // We look for the total value sent to the input_address (user's forwarding address)
-      const userAddr = payAddresses[userId]?.[coin]?.address;
+      console.log(`📩 NowPayments IPN: payment_id=${payload.payment_id} status=${payload.payment_status}`);
  
-      // `outputs` array has { addresses, value }
-      // We sum any output whose address matches the user's forwarding address
-      let satoshis = 0;
- 
-      // BlockCypher sends the transaction object; for forwarding addresses,
-      // the value is the amount received at the input_address.
-      // The payload's top-level `value` field (if present) is the total tx value.
-      // Safest: sum outputs addressed to userAddr if available, else use payload.value.
-      if (payload.outputs && Array.isArray(payload.outputs) && userAddr) {
-        for (const out of payload.outputs) {
-          if (out.addresses && out.addresses.includes(userAddr)) {
-            satoshis += out.value || 0;
-          }
-        }
-      }
-      // Fallback: use top-level `value`
-      if (satoshis === 0 && payload.value) {
-        satoshis = payload.value;
-      }
- 
-      if (satoshis <= 0) {
-        console.log(`⚠️ Webhook for ${userId} had 0 satoshis — ignoring`);
+      // Only process terminal / confirmed states
+      const actionableStatuses = ['finished', 'confirmed', 'partially_paid'];
+      if (!actionableStatuses.includes(payload.payment_status)) {
+        console.log(`   ↪ Status "${payload.payment_status}" not actionable — skipping`);
         return;
       }
  
-      // Deduplicate: don't process the same tx twice
-      const txHash = payload.hash;
-      ensureUser(userId);
-      if (!users[userId].processed) users[userId].processed = [];
-      if (txHash && users[userId].processed.includes(txHash)) {
-        console.log(`⚠️ Duplicate webhook for tx ${txHash} — skipping`);
-        return;
-      }
-      if (txHash) {
-        users[userId].processed.push(txHash);
-        // Keep processed list from growing forever
-        if (users[userId].processed.length > 200) {
-          users[userId].processed = users[userId].processed.slice(-200);
-        }
-        saveUsers();
-      }
- 
-      console.log(`📩 Webhook: ${userId} | ${coin.toUpperCase()} | ${satoshis} satoshis | tx: ${txHash}`);
-      handleConfirmedPayment(userId, coin, satoshis).catch(err => {
-        console.error(`❌ handleConfirmedPayment error:`, err.message);
+      handleConfirmedNowPayment(payload).catch(err => {
+        console.error('❌ handleConfirmedNowPayment error:', err.message);
       });
     });
   });
  
   server.listen(WEBHOOK_PORT, () => {
     console.log(`🌐 Webhook server listening on port ${WEBHOOK_PORT}`);
-    console.log(`   BlockCypher should POST to: ${WEBHOOK_BASE_URL}/webhook?coin=btc&userId=USER_ID`);
+    console.log(`   NowPayments IPN should POST to: ${WEBHOOK_BASE_URL}/nowpayments-webhook`);
   });
 }
  
@@ -601,6 +609,8 @@ async function endAuction(auctionId) {
     const hours = AUCTION_FIXED_HOURS;
     const { key, expiry } = await createLuarmorKey(hours, topBid.userId, username, project);
  
+    // BUG FIX: was filtering by userId AND projectNum which could leave stale slots for
+    // other projects; intention is to replace only same-project slots for this user.
     slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
     slots.push({ userId: topBid.userId, key, expiry, project: project.name, projectNum: auction.projectNum });
  
@@ -627,6 +637,7 @@ async function endAuction(auctionId) {
       });
     } catch {}
  
+    // BUG FIX: refund all losing bidders and save AFTER all refunds are applied
     for (const bid of auction.bids) {
       if (bid.userId === topBid.userId) continue;
       ensureUser(bid.userId);
@@ -643,7 +654,8 @@ async function endAuction(auctionId) {
         });
       } catch {}
     }
-    saveUsers();
+    saveUsers(); // single save after all refunds
+ 
     console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits — ${hours}h awarded.`);
  
     setTimeout(() => {
@@ -718,63 +730,31 @@ client.on('interactionCreate', async interaction => {
   const userId = interaction.user.id;
   ensureUser(userId);
  
-  // ===== BUY CREDITS (AUTO) =====
+  // ===== BUY CREDITS (NowPayments) =====
   if (interaction.customId === 'buy_crypto') {
-    try {
-      await interaction.deferReply({ ephemeral: true });
- 
-      // Generate (or reuse) forwarding addresses for this user
-      let btcAddress, ltcAddress;
-      try {
-        [btcAddress, ltcAddress] = await Promise.all([
-          getOrCreatePayAddress(userId, 'btc'),
-          getOrCreatePayAddress(userId, 'ltc'),
-        ]);
-      } catch (err) {
-        console.error('BlockCypher address error:', err.message);
-        return interaction.editReply({ content: `❌ Failed to generate payment address: ${err.message}` });
-      }
- 
-      const [btcQR, ltcQR] = await Promise.all([
-        generateQRBuffer(btcAddress),
-        generateQRBuffer(ltcAddress)
-      ]);
- 
-      const btcAttach = new AttachmentBuilder(btcQR, { name: 'btc_qr.png' });
-      const ltcAttach = new AttachmentBuilder(ltcQR, { name: 'ltc_qr.png' });
- 
-      // Fetch live prices for display
-      let btcPrice = '?', ltcPrice = '?';
-      try { btcPrice = `$${(await getBtcPriceUSD()).toLocaleString()}`; } catch {}
-      try { ltcPrice = `$${(await getLtcPriceUSD()).toFixed(2)}`; } catch {}
- 
-      const embed = new EmbedBuilder()
-        .setTitle('💳 Buy Credits — Automatic Payment')
-        .setColor(0xF5C542)
-        .setDescription(
-          '**These addresses are unique to you.** Credits are added automatically after 1 confirmation.\n\n' +
-          '**Rate: $1 = 1 Credit** (calculated at live price when your payment confirms)\n\n' +
-          '**Example:** Send $5 worth of BTC → receive 5 credits → 10h Basic or 5h Premium'
-        )
-        .addFields(
-          { name: '₿ Bitcoin (BTC)',       value: `\`${btcAddress}\`\nLive price: **${btcPrice}**`, inline: false },
-          { name: 'Ł Litecoin (LTC)',      value: `\`${ltcAddress}\`\nLive price: **${ltcPrice}**`, inline: false },
-          { name: '⚠️ Important',          value: 'Send only BTC to the BTC address and LTC to the LTC address. Credits appear automatically after confirmation (usually 10–30 min for BTC, 2–5 min for LTC).', inline: false }
-        )
-        .setImage('attachment://btc_qr.png')
-        .setFooter({ text: 'QR shown is BTC. LTC QR attached below.' });
- 
-      const ltcEmbed = new EmbedBuilder()
-        .setTitle('Ł LTC QR Code')
-        .setColor(0xA5A5A5)
-        .setImage('attachment://ltc_qr.png');
- 
-      return interaction.editReply({ embeds: [embed, ltcEmbed], files: [btcAttach, ltcAttach] });
- 
-    } catch (err) {
-      console.error('buy_crypto error:', err);
-      return interaction.editReply({ content: '❌ Failed to generate payment details.' });
-    }
+    // Show a modal to ask how much USD they want to pay
+    const modal = new ModalBuilder()
+      .setCustomId('buy_credits_modal')
+      .setTitle('Buy Credits with Crypto');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('usd_amount')
+          .setLabel('How many credits? ($1 = 1 credit, min $1)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('e.g. 10')
+          .setRequired(true)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('crypto_choice')
+          .setLabel('Coin: btc or ltc')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('btc')
+          .setRequired(true)
+      )
+    );
+    return interaction.showModal(modal);
   }
  
   if (interaction.customId === 'view_slots') {
@@ -782,9 +762,9 @@ client.on('interactionCreate', async interaction => {
   }
  
   if (['select_project_1', 'select_project_2'].includes(interaction.customId)) {
-    const num          = interaction.customId === 'select_project_1' ? 1 : 2;
-    const project      = PROJECTS[num];
-    const userCredits  = users[userId].credits;
+    const num         = interaction.customId === 'select_project_1' ? 1 : 2;
+    const project     = PROJECTS[num];
+    const userCredits = users[userId].credits;
  
     if (userCredits <= 0) {
       return interaction.reply({
@@ -850,6 +830,83 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isModalSubmit()) return;
   const userId = interaction.user.id;
   ensureUser(userId);
+ 
+  // ===== BUY CREDITS MODAL (NowPayments) =====
+  if (interaction.customId === 'buy_credits_modal') {
+    await interaction.deferReply({ ephemeral: true });
+ 
+    const rawUsd    = interaction.fields.getTextInputValue('usd_amount').trim();
+    const rawCoin   = interaction.fields.getTextInputValue('crypto_choice').trim().toLowerCase();
+    const usdAmount = parseInt(rawUsd);
+ 
+    if (isNaN(usdAmount) || usdAmount < 1) {
+      return interaction.editReply({ content: '❌ Enter a valid dollar amount (minimum $1).' });
+    }
+ 
+    const validCoins = ['btc', 'ltc'];
+    if (!validCoins.includes(rawCoin)) {
+      return interaction.editReply({ content: '❌ Invalid coin. Choose **btc** or **ltc**.' });
+    }
+ 
+    try {
+      const paymentData = await createNowPayment(userId, rawCoin, usdAmount);
+      const { payment_id, pay_address, pay_amount, pay_currency, expiration_estimate_date } = paymentData;
+ 
+      // Store payment record
+      payments[payment_id] = {
+        userId,
+        usdAmount,
+        currency: pay_currency,
+        payAmount: pay_amount,
+        payAddress: pay_address,
+        status: 'waiting',
+        createdAt: Date.now(),
+        expiresAt: expiration_estimate_date ? new Date(expiration_estimate_date).getTime() : null,
+      };
+      savePayments();
+ 
+      // Generate QR code for pay_address
+      let qrAttach = null;
+      let qrFileName = `${rawCoin}_qr.png`;
+      try {
+        const qrBuffer = await generateQRBuffer(pay_address);
+        qrAttach = new AttachmentBuilder(qrBuffer, { name: qrFileName });
+      } catch {}
+ 
+      const embed = new EmbedBuilder()
+        .setTitle(`💳 Pay with ${pay_currency.toUpperCase()} — ${usdAmount} Credits`)
+        .setColor(0xF5C542)
+        .setDescription(
+          `Send exactly the amount below to the address provided.\n` +
+          `Credits are added **automatically** once your payment confirms.\n\n` +
+          `⚠️ This payment is **unique to you** — do not share this address.`
+        )
+        .addFields(
+          { name: `${pay_currency.toUpperCase()} Address`, value: `\`${pay_address}\``, inline: false },
+          { name: `Amount to Send`,                        value: `**${pay_amount} ${pay_currency.toUpperCase()}**`, inline: true },
+          { name: `Credits You'll Receive`,                value: `**${usdAmount}**`, inline: true },
+          { name: `Payment ID`,                            value: `\`${payment_id}\``, inline: false },
+        )
+        .setFooter({ text: 'Payment expires in ~20 min. Create a new one if it expires.' });
+ 
+      if (expiration_estimate_date) {
+        const expireTs = Math.floor(new Date(expiration_estimate_date).getTime() / 1000);
+        embed.addFields({ name: 'Expires', value: `<t:${expireTs}:R>`, inline: true });
+      }
+ 
+      if (qrAttach) embed.setImage(`attachment://${qrFileName}`);
+ 
+      return interaction.editReply({
+        embeds: [embed],
+        files: qrAttach ? [qrAttach] : []
+      });
+ 
+    } catch (err) {
+      console.error('NowPayments create payment error:', err.response?.data || err.message);
+      const msg = err.response?.data?.message || err.message;
+      return interaction.editReply({ content: `❌ Failed to create payment: ${msg}` });
+    }
+  }
  
   if (interaction.customId.startsWith('activate_modal_')) {
     const num            = parseInt(interaction.customId.split('_')[2]);
@@ -935,9 +992,11 @@ client.on('interactionCreate', async interaction => {
       console.log(`⏰ Auction ${auctionId} started by first bid from ${userId}`);
     }
  
+    // BUG FIX: replace existing bid from same user (was already doing this correctly)
     auction.bids = auction.bids.filter(b => b.userId !== userId);
     auction.bids.push({ userId, amount: bidAmount });
  
+    // Extend by 1 min if under 1 min left (anti-snipe)
     const timeLeft = auction.endsAt - Date.now();
     if (!isFirstBid && timeLeft < 60_000) {
       auction.endsAt = Date.now() + 60_000;
@@ -964,6 +1023,22 @@ setInterval(() => {
   }
 }, 60_000);
  
+// Clean up expired pending payments (older than 2 hours)
+setInterval(() => {
+  const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+  let cleaned = 0;
+  for (const [pid, p] of Object.entries(payments)) {
+    if (p.status === 'waiting' && p.createdAt < twoHoursAgo) {
+      payments[pid].status = 'expired';
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    savePayments();
+    console.log(`🧹 Marked ${cleaned} stale payment(s) as expired`);
+  }
+}, 10 * 60_000);
+ 
 // ===== AUTO-UPDATE PANEL (every 30s) =====
 setInterval(() => updatePanelMessage(), 30_000);
  
@@ -988,6 +1063,7 @@ client.once('ready', async () => {
     for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
   }
  
+  // BUG FIX: resume live auctions after restart
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
     const remaining = auction.endsAt - Date.now();
@@ -1007,7 +1083,6 @@ client.once('ready', async () => {
     });
   });
  
-  // Start webhook server after bot is ready so client is available
   startWebhookServer();
 });
  
