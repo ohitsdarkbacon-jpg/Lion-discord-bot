@@ -24,17 +24,17 @@ const crypto = require('crypto');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
  
 // ===== FILES =====
-const USERS_FILE       = './users.json';
-const SLOTS_FILE       = './slots.json';
-const AUCTIONS_FILE    = './auctions.json';
-const PANEL_STATE_FILE = './panel_state.json';
-const PAYMENTS_FILE    = './payments.json';
+const USERS_FILE         = './users.json';
+const SLOTS_FILE         = './slots.json';
+const AUCTIONS_FILE      = './auctions.json';
+const PANEL_STATE_FILE   = './panel_state.json';
+const PAYMENTS_FILE      = './payments.json';
+const CREDITS_BACKUP_FILE = './credits_backup.json'; // FIX 3: persistent credits backup
  
 let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
 let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
 let auctions   = fs.existsSync(AUCTIONS_FILE)    ? JSON.parse(fs.readFileSync(AUCTIONS_FILE))    : {};
 let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
-// payments[payment_id] = { userId, usdAmount, currency, payAmount, payAddress, status, createdAt }
 let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PAYMENTS_FILE))    : {};
  
 // ===== PROJECT CONFIG =====
@@ -49,6 +49,8 @@ const AUCTION_PROJECTS      = [3, 4];
 const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
 const AUCTION_FIXED_HOURS   = 2;
+// FIX 1: how long a won auction slot is locked (must match AUCTION_FIXED_HOURS)
+const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000; // 2 hours in ms
  
 const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || `http://localhost:${WEBHOOK_PORT}`;
@@ -64,6 +66,19 @@ function saveAuctions()  { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(auc
 function savePanelState(){ fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
 function savePayments()  { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
  
+// FIX 3: save/load credits backup independently of users.json
+function saveCreditsBackup() {
+  const backup = {};
+  for (const [userId, data] of Object.entries(users)) {
+    backup[userId] = data.credits || 0;
+  }
+  fs.writeFileSync(CREDITS_BACKUP_FILE, JSON.stringify(backup, null, 2));
+}
+function loadCreditsBackup() {
+  if (!fs.existsSync(CREDITS_BACKUP_FILE)) return null;
+  return JSON.parse(fs.readFileSync(CREDITS_BACKUP_FILE));
+}
+ 
 // ===== COMMANDS =====
 const commands = [
   new SlashCommandBuilder().setName('panel').setDescription('Open slot panel'),
@@ -73,6 +88,17 @@ const commands = [
     .setDescription('Give credits to a user ($1 = 1 credit)')
     .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true))
     .addIntegerOption(opt => opt.setName('amount').setDescription('Amount of credits').setRequired(true)),
+  // FIX 3: new admin commands for credit persistence
+  new SlashCommandBuilder()
+    .setName('backupcredits')
+    .setDescription('(Admin) Save all user credits to a persistent backup file'),
+  new SlashCommandBuilder()
+    .setName('restorecredits')
+    .setDescription('(Admin) Restore all user credits from the backup file (does not erase extra users)'),
+  new SlashCommandBuilder()
+    .setName('checkcredits')
+    .setDescription('(Admin) Check a user\'s current credit balance')
+    .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true)),
 ].map(c => c.toJSON());
  
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -135,6 +161,14 @@ function getActiveSlots(projectNum) {
   return slots.filter(s => s?.projectNum === projectNum && s.expiry > Date.now()).length;
 }
  
+// FIX 1: check whether an auction slot is currently in cooldown (winner's key still active)
+function isAuctionSlotOnCooldown(projectNum, slotIndex) {
+  const aId    = getAuctionId(projectNum, slotIndex);
+  const auction = auctions[aId];
+  if (!auction || !auction.cooldownUntil) return false;
+  return auction.cooldownUntil > Date.now();
+}
+ 
 // ===== QR CODE =====
 async function generateQRBuffer(text) {
   return QRCode.toBuffer(text, { type: 'png', width: 200, margin: 2 });
@@ -144,7 +178,6 @@ async function generateQRBuffer(text) {
 // ========= NOWPAYMENTS HELPERS ==========
 // ========================================
  
-// NowPayments IPN signature: HMAC-SHA512 over alphabetically-sorted JSON body
 function verifyNowPaymentsSignature(rawBody, signature) {
   if (!NOWPAYMENTS_IPN_SECRET) {
     console.warn('⚠️  NOWPAYMENTS_IPN_SECRET not set — skipping signature check (unsafe in production!)');
@@ -172,7 +205,6 @@ function sortObjectKeys(obj) {
   return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortObjectKeys(obj[k]); return acc; }, {});
 }
  
-// Create a NowPayments invoice and return the full response
 async function createNowPayment(userId, currency, usdAmount) {
   const orderId = `${userId}_${Date.now()}`;
   const res = await axios.post(
@@ -181,8 +213,8 @@ async function createNowPayment(userId, currency, usdAmount) {
       price_amount:        usdAmount,
       price_currency:      'usd',
       pay_currency:        currency,
-      order_id:            orderId,         // format: "{userId}_{ts}" — used as fallback lookup
-      order_description:   userId,          // plain userId for easy IPN lookup
+      order_id:            orderId,
+      order_description:   userId,
       ipn_callback_url:    `${WEBHOOK_BASE_URL}/nowpayments-webhook`,
       is_fixed_rate:       false,
       is_fee_paid_by_user: false,
@@ -192,7 +224,6 @@ async function createNowPayment(userId, currency, usdAmount) {
   return { ...res.data, _orderId: orderId };
 }
  
-// Poll NowPayments for a single payment's current status
 async function pollPaymentStatus(paymentId) {
   const res = await axios.get(
     `${NOWPAYMENTS_BASE}/payment/${paymentId}`,
@@ -201,13 +232,7 @@ async function pollPaymentStatus(paymentId) {
   return res.data;
 }
  
-// ===================================================
-// ===== CREDIT DELIVERY — single source of truth ====
-// ===================================================
-// Called from both the IPN webhook AND the polling fallback.
-// Deduplication ensures credits are never double-awarded.
 async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrency) {
-  // Primary lookup: our local payments store (guaranteed to have userId)
   const record = payments[paymentId];
   if (!record) {
     console.warn(`⚠️  deliverCredits: no local record found for payment_id=${paymentId}`);
@@ -217,21 +242,17 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
   const { userId, usdAmount, payAmount } = record;
   ensureUser(userId);
  
-  // Deduplication guard — never credit the same payment twice
   const dedupKey = `np_${paymentId}`;
   if (users[userId].processed.includes(dedupKey)) {
     console.log(`⏭️  Payment ${paymentId} already credited to ${userId} — skipping`);
     return;
   }
  
-  // Calculate USD value to credit
   let usdValue = 0;
  
   if (paymentStatus === 'finished' || paymentStatus === 'confirmed') {
-    // Full payment — credit exactly what was invoiced in USD
     usdValue = parseFloat(usdAmount) || 0;
   } else if (paymentStatus === 'partially_paid') {
-    // Pro-rate: how much crypto arrived vs how much was expected
     const paid     = parseFloat(actuallyPaid) || 0;
     const expected = parseFloat(payAmount)    || 0;
     if (expected > 0) {
@@ -247,13 +268,12 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
     return;
   }
  
-  // Apply credits atomically, mark as processed, save
   users[userId].credits += credits;
   users[userId].processed.push(dedupKey);
   if (users[userId].processed.length > 200) users[userId].processed = users[userId].processed.slice(-200);
   saveUsers();
+  saveCreditsBackup(); // FIX 3: keep backup in sync whenever credits change
  
-  // Update the payment record
   record.status       = 'credited';
   record.creditedAt   = Date.now();
   record.creditsGiven = credits;
@@ -261,7 +281,6 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
  
   console.log(`💰 Credited ${credits} credits to ${userId} (payment ${paymentId}, ~$${usdValue.toFixed(2)} via ${payCurrency})`);
  
-  // DM the user
   try {
     const discordUser = await client.users.fetch(userId);
     await discordUser.send({
@@ -286,10 +305,6 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
   updatePanelMessage().catch(() => {});
 }
  
-// ===================================================
-// ========== POLLING FALLBACK (every 2 min) =========
-// ===================================================
-// Catches payments where the IPN webhook was never delivered.
 async function pollPendingPayments() {
   const pending = Object.entries(payments).filter(([, p]) => p.status === 'waiting');
   if (pending.length === 0) return;
@@ -297,10 +312,8 @@ async function pollPendingPayments() {
   console.log(`🔄 Polling ${pending.length} pending payment(s)...`);
  
   for (const [paymentId, record] of pending) {
-    // Skip payments < 2 min old — give NowPayments time to process
     if (Date.now() - record.createdAt < 2 * 60 * 1000) continue;
  
-    // Auto-expire after 90 minutes
     if (Date.now() - record.createdAt > 90 * 60 * 1000) {
       payments[paymentId].status = 'expired';
       savePayments();
@@ -323,7 +336,6 @@ async function pollPendingPayments() {
       console.error(`❌ Poll error for ${paymentId}:`, err.response?.data || err.message);
     }
  
-    // Brief pause between calls to avoid rate limiting
     await new Promise(r => setTimeout(r, 600));
   }
 }
@@ -336,11 +348,9 @@ function startWebhookServer() {
       return res.end('Not found');
     }
  
-    // Collect full body first
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-      // Respond 200 immediately so NowPayments doesn't retry
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
  
@@ -363,7 +373,6 @@ async function processWebhookBody(body, headers) {
     return;
   }
  
-  // Verify IPN signature
   const sig = headers['x-nowpayments-sig'];
   if (!verifyNowPaymentsSignature(body, sig)) return;
  
@@ -384,8 +393,6 @@ async function processWebhookBody(body, headers) {
     return;
   }
  
-  // If we have no local record (e.g. server restarted after invoice was created but before it was saved),
-  // try to reconstruct one from the IPN data. order_id format is "{userId}_{timestamp}".
   if (!payments[payment_id]) {
     const userId = order_id ? order_id.split('_')[0] : null;
     if (userId) {
@@ -477,7 +484,15 @@ function generateAuctionSectionEmbed() {
       const auction = auctions[aId];
       let statusLine, topBidLine, timeLine;
  
-      if (!auction || auction.status === 'idle') {
+      // FIX 1: show cooldown state
+      const onCooldown = isAuctionSlotOnCooldown(num, i);
+ 
+      if (onCooldown) {
+        const timeLeft = Math.max(0, auction.cooldownUntil - now);
+        statusLine = '🔒 **Occupied** (winner\'s key active)';
+        topBidLine = auction._lastWinner ? `<@${auction._lastWinner}>` : '—';
+        timeLine   = `unlocks in ${formatTime(timeLeft)}`;
+      } else if (!auction || auction.status === 'idle') {
         statusLine = '⚪ **Waiting for first bid**'; topBidLine = 'No bids yet'; timeLine = '—';
       } else if (auction.status === 'live') {
         const timeLeft = Math.max(0, auction.endsAt - now);
@@ -519,14 +534,16 @@ function buildBidRow() {
     const icon       = num === 3 ? '🌾' : '⚔️';
     const components = [];
     for (let i = 1; i <= BID_SLOTS; i++) {
-      const aId    = getAuctionId(num, i);
+      const aId     = getAuctionId(num, i);
       const auction = auctions[aId];
+      // FIX 1: disable button during cooldown OR when auction ended
+      const onCooldown = isAuctionSlotOnCooldown(num, i);
       components.push(
         new ButtonBuilder()
           .setCustomId(`place_bid_${aId}`)
           .setLabel(`${icon} ${proj.name} Slot ${i}`)
           .setStyle(ButtonStyle.Primary)
-          .setDisabled(auction?.status === 'ended')
+          .setDisabled(auction?.status === 'ended' || onCooldown)
       );
     }
     rows.push(new ActionRowBuilder().addComponents(...components));
@@ -580,10 +597,18 @@ async function endAuction(auctionId) {
   const topBid = getTopBid(auction);
   await updatePanelMessage();
  
+  // FIX 1: reset to idle after cooldown expires, not after a fixed short delay
   const resetToIdle = (delay = 10_000) => {
     setTimeout(() => {
       if (auctions[auctionId]) {
-        auctions[auctionId] = { ...auctions[auctionId], status: 'idle', bids: [], endsAt: null };
+        auctions[auctionId] = {
+          ...auctions[auctionId],
+          status:        'idle',
+          bids:          [],
+          endsAt:        null,
+          cooldownUntil: null, // clear cooldown
+          _lastWinner:   null,
+        };
         saveAuctions();
         updatePanelMessage();
       }
@@ -614,12 +639,18 @@ async function endAuction(auctionId) {
  
     const { key, expiry } = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
  
+    // FIX 1: set cooldown so nobody can bid while winner's key is active
+    auction.cooldownUntil = Date.now() + AUCTION_COOLDOWN_MS;
+    auction._lastWinner   = topBid.userId;
+    saveAuctions();
+ 
     slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
     slots.push({ userId: topBid.userId, key, expiry, project: project.name, projectNum: auction.projectNum });
  
     users[topBid.userId].credits -= topBid.amount;
     saveUsers();
     saveSlots();
+    saveCreditsBackup(); // FIX 3: sync backup after deduction
  
     try {
       const discordUser = await client.users.fetch(topBid.userId);
@@ -640,11 +671,11 @@ async function endAuction(auctionId) {
       });
     } catch {}
  
-    // Refund all losing bidders then save once
+    // FIX 2: refund losers exactly what they bid — no +1, no extra
     for (const bid of auction.bids) {
       if (bid.userId === topBid.userId) continue;
       ensureUser(bid.userId);
-      users[bid.userId].credits += bid.amount;
+      users[bid.userId].credits += bid.amount; // exact refund only
       try {
         const loser = await client.users.fetch(bid.userId);
         await loser.send({
@@ -658,9 +689,12 @@ async function endAuction(auctionId) {
       } catch {}
     }
     saveUsers();
+    saveCreditsBackup(); // FIX 3: sync backup after refunds
  
     console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits`);
-    resetToIdle(15_000);
+ 
+    // FIX 1: reset to idle only after the full 2-hour cooldown
+    resetToIdle(AUCTION_COOLDOWN_MS);
  
   } catch (err) {
     console.error(`❌ Key generation failed for ${auctionId}:`, err.message);
@@ -692,7 +726,10 @@ client.on('interactionCreate', async interaction => {
       for (let i = 1; i <= BID_SLOTS; i++) {
         const aId = getAuctionId(num, i);
         const a   = auctions[aId];
-        const st  = !a || a.status === 'idle' ? '⚪ Idle' : a.status === 'live' ? '🔴 Live' : '✅ Ended';
+        const onCooldown = isAuctionSlotOnCooldown(num, i);
+        const st  = onCooldown
+          ? `🔒 Cooldown (${formatTime(a.cooldownUntil - Date.now())} left)`
+          : !a || a.status === 'idle' ? '⚪ Idle' : a.status === 'live' ? '🔴 Live' : '✅ Ended';
         lines.push(`${proj.name} Slot ${i}: ${st}`);
       }
     }
@@ -708,7 +745,47 @@ client.on('interactionCreate', async interaction => {
     ensureUser(target.id);
     users[target.id].credits += amount;
     saveUsers();
+    saveCreditsBackup(); // FIX 3: sync backup after manual grant
     return interaction.reply({ content: `✅ Gave **${amount} credits** to ${target.tag}. Balance: **${users[target.id].credits}**` });
+  }
+ 
+  // FIX 3: /backupcredits — snapshot all credits to credits_backup.json
+  if (interaction.commandName === 'backupcredits' && isAdmin) {
+    saveCreditsBackup();
+    const count = Object.keys(users).length;
+    return interaction.reply({
+      content: `✅ Credits backed up for **${count} user(s)** → \`credits_backup.json\`.\nThis file survives bot resets — run \`/restorecredits\` after a reset to bring them back.`,
+      ephemeral: true
+    });
+  }
+ 
+  // FIX 3: /restorecredits — load credits_backup.json and merge into current users
+  if (interaction.commandName === 'restorecredits' && isAdmin) {
+    const backup = loadCreditsBackup();
+    if (!backup) {
+      return interaction.reply({ content: '❌ No backup file found (`credits_backup.json`). Run `/backupcredits` first.', ephemeral: true });
+    }
+    let restored = 0;
+    for (const [userId, credits] of Object.entries(backup)) {
+      ensureUser(userId);
+      users[userId].credits = credits; // overwrite with backed-up value
+      restored++;
+    }
+    saveUsers();
+    return interaction.reply({
+      content: `✅ Restored credits for **${restored} user(s)** from backup.\nExisting users not in the backup are left untouched.`,
+      ephemeral: true
+    });
+  }
+ 
+  // FIX 3: /checkcredits — admin lookup of any user's balance
+  if (interaction.commandName === 'checkcredits' && isAdmin) {
+    const target = interaction.options.getUser('user');
+    ensureUser(target.id);
+    return interaction.reply({
+      content: `💳 **${target.tag}** has **${users[target.id].credits} credits**.`,
+      ephemeral: true
+    });
   }
 });
  
@@ -718,7 +795,6 @@ client.on('interactionCreate', async interaction => {
   const userId = interaction.user.id;
   ensureUser(userId);
  
-  // ===== BUY CREDITS =====
   if (interaction.customId === 'buy_crypto') {
     const modal = new ModalBuilder()
       .setCustomId('buy_credits_modal')
@@ -782,6 +858,12 @@ client.on('interactionCreate', async interaction => {
     ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
     const auction   = auctions[auctionId];
  
+    // FIX 1: block bids during cooldown (double-check even though button is disabled)
+    if (isAuctionSlotOnCooldown(parseInt(parts[1]), parseInt(parts[2]))) {
+      const timeLeft = formatTime(auction.cooldownUntil - Date.now());
+      return interaction.reply({ content: `🔒 This slot is occupied. Bidding opens again in **${timeLeft}**.`, ephemeral: true });
+    }
+ 
     if (auction.status === 'ended') {
       return interaction.reply({ content: '❌ This auction just ended. Wait for the next one.', ephemeral: true });
     }
@@ -812,7 +894,6 @@ client.on('interactionCreate', async interaction => {
   const userId = interaction.user.id;
   ensureUser(userId);
  
-  // ===== BUY CREDITS MODAL =====
   if (interaction.customId === 'buy_credits_modal') {
     await interaction.deferReply({ ephemeral: true });
  
@@ -836,7 +917,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ content: '❌ NowPayments returned an incomplete response. Try again in a moment.' });
       }
  
-      // Save record — deliverCredits will look this up by payment_id to get userId
       payments[payment_id] = {
         userId,
         usdAmount,
@@ -851,7 +931,6 @@ client.on('interactionCreate', async interaction => {
  
       console.log(`🧾 Invoice created: payment_id=${payment_id} userId=${userId} amount=${usdAmount} USD via ${pay_currency}`);
  
-      // Generate QR code
       let qrAttach   = null;
       const qrFile   = `${rawCoin}_qr.png`;
       try {
@@ -892,7 +971,6 @@ client.on('interactionCreate', async interaction => {
     }
   }
  
-  // ===== ACTIVATE SLOT MODAL =====
   if (interaction.customId.startsWith('activate_modal_')) {
     const num            = parseInt(interaction.customId.split('_')[2]);
     const project        = PROJECTS[num];
@@ -919,6 +997,7 @@ client.on('interactionCreate', async interaction => {
       users[userId].credits -= creditsToSpend;
       saveUsers();
       saveSlots();
+      saveCreditsBackup(); // FIX 3: sync backup after slot activation
       updatePanelMessage();
  
       return interaction.reply({
@@ -944,12 +1023,16 @@ client.on('interactionCreate', async interaction => {
     }
   }
  
-  // ===== BID MODAL =====
   if (interaction.customId.startsWith('bid_modal_')) {
     const auctionId = interaction.customId.replace('bid_modal_', '');
     const parts     = auctionId.split('_');
     ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
     const auction   = auctions[auctionId];
+ 
+    // FIX 1: block bids during cooldown (modal guard)
+    if (isAuctionSlotOnCooldown(parseInt(parts[1]), parseInt(parts[2]))) {
+      return interaction.reply({ content: '🔒 This slot is occupied by the winner. Bidding is locked until the key expires.', ephemeral: true });
+    }
  
     if (auction.status === 'ended') {
       return interaction.reply({ content: '❌ This auction just ended.', ephemeral: true });
@@ -981,7 +1064,6 @@ client.on('interactionCreate', async interaction => {
     auction.bids = auction.bids.filter(b => b.userId !== userId);
     auction.bids.push({ userId, amount: bidAmount });
  
-    // Anti-snipe: extend by 1 min if < 1 min left
     const timeLeft = auction.endsAt - Date.now();
     if (!isFirstBid && timeLeft < 60_000) {
       auction.endsAt = Date.now() + 60_000;
@@ -1000,17 +1082,14 @@ client.on('interactionCreate', async interaction => {
  
 // ===== INTERVALS =====
  
-// Slot expiry cleanup every 60s
 setInterval(() => {
   const before = slots.length;
   slots = slots.filter(s => s && s.expiry > Date.now());
   if (slots.length !== before) { saveSlots(); console.log(`🧹 Cleaned ${before - slots.length} expired slot(s)`); }
 }, 60_000);
  
-// Panel refresh every 30s
 setInterval(() => updatePanelMessage(), 30_000);
  
-// Auction countdown every 10s
 setInterval(() => {
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
@@ -1019,7 +1098,6 @@ setInterval(() => {
   }
 }, 10_000);
  
-// Payment polling fallback every 2 minutes
 setInterval(() => {
   pollPendingPayments().catch(err => console.error('❌ pollPendingPayments error:', err.message));
 }, 2 * 60 * 1000);
@@ -1031,7 +1109,6 @@ client.once('ready', async () => {
  
   for (const num of AUCTION_PROJECTS) for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
  
-  // Resume any auctions that were live before restart
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
     const remaining = auction.endsAt - Date.now();
@@ -1043,6 +1120,27 @@ client.once('ready', async () => {
     }
   }
  
+  // FIX 1: resume any cooldown timers that were running before restart
+  for (const [auctionId, auction] of Object.entries(auctions)) {
+    if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) continue;
+    const remaining = auction.cooldownUntil - Date.now();
+    console.log(`🔒 Resuming cooldown for ${auctionId} — unlocks in ${formatTime(remaining)}`);
+    setTimeout(() => {
+      if (auctions[auctionId]) {
+        auctions[auctionId] = {
+          ...auctions[auctionId],
+          status:        'idle',
+          bids:          [],
+          endsAt:        null,
+          cooldownUntil: null,
+          _lastWinner:   null,
+        };
+        saveAuctions();
+        updatePanelMessage();
+      }
+    }, remaining);
+  }
+ 
   https.get('https://api.ipify.org?format=json', res => {
     let data = '';
     res.on('data', c => data += c);
@@ -1051,7 +1149,6 @@ client.once('ready', async () => {
  
   startWebhookServer();
  
-  // Poll once 10s after startup to catch anything missed while offline
   setTimeout(() => pollPendingPayments().catch(() => {}), 10_000);
 });
  
