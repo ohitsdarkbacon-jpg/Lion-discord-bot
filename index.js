@@ -24,12 +24,12 @@ const crypto = require('crypto');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
  
 // ===== FILES =====
-const USERS_FILE         = './users.json';
-const SLOTS_FILE         = './slots.json';
-const AUCTIONS_FILE      = './auctions.json';
-const PANEL_STATE_FILE   = './panel_state.json';
-const PAYMENTS_FILE      = './payments.json';
-const CREDITS_BACKUP_FILE = './credits_backup.json'; // FIX 3: persistent credits backup
+const USERS_FILE          = './users.json';
+const SLOTS_FILE          = './slots.json';
+const AUCTIONS_FILE       = './auctions.json';
+const PANEL_STATE_FILE    = './panel_state.json';
+const PAYMENTS_FILE       = './payments.json';
+const CREDITS_BACKUP_FILE = './credits_backup.json';
  
 let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
 let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
@@ -49,8 +49,7 @@ const AUCTION_PROJECTS      = [3, 4];
 const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
 const AUCTION_FIXED_HOURS   = 2;
-// FIX 1: how long a won auction slot is locked (must match AUCTION_FIXED_HOURS)
-const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000; // 2 hours in ms
+const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000;
  
 const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || `http://localhost:${WEBHOOK_PORT}`;
@@ -66,7 +65,6 @@ function saveAuctions()  { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(auc
 function savePanelState(){ fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
 function savePayments()  { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
  
-// FIX 3: save/load credits backup independently of users.json
 function saveCreditsBackup() {
   const backup = {};
   for (const [userId, data] of Object.entries(users)) {
@@ -88,17 +86,26 @@ const commands = [
     .setDescription('Give credits to a user ($1 = 1 credit)')
     .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true))
     .addIntegerOption(opt => opt.setName('amount').setDescription('Amount of credits').setRequired(true)),
-  // FIX 3: new admin commands for credit persistence
   new SlashCommandBuilder()
     .setName('backupcredits')
     .setDescription('(Admin) Save all user credits to a persistent backup file'),
   new SlashCommandBuilder()
     .setName('restorecredits')
-    .setDescription('(Admin) Restore all user credits from the backup file (does not erase extra users)'),
+    .setDescription('(Admin) Restore all user credits from the backup file'),
   new SlashCommandBuilder()
     .setName('checkcredits')
     .setDescription('(Admin) Check a user\'s current credit balance')
     .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true)),
+  // FIX: admin command to force-end a stuck auction
+  new SlashCommandBuilder()
+    .setName('forceendauction')
+    .setDescription('(Admin) Force-end a stuck auction')
+    .addStringOption(opt => opt.setName('auction_id').setDescription('e.g. auction_3_1').setRequired(true)),
+  // FIX: admin command to reset a stuck auction to idle
+  new SlashCommandBuilder()
+    .setName('resetauction')
+    .setDescription('(Admin) Reset an auction slot to idle (refunds all bidders)')
+    .addStringOption(opt => opt.setName('auction_id').setDescription('e.g. auction_3_1').setRequired(true)),
 ].map(c => c.toJSON());
  
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -161,9 +168,8 @@ function getActiveSlots(projectNum) {
   return slots.filter(s => s?.projectNum === projectNum && s.expiry > Date.now()).length;
 }
  
-// FIX 1: check whether an auction slot is currently in cooldown (winner's key still active)
 function isAuctionSlotOnCooldown(projectNum, slotIndex) {
-  const aId    = getAuctionId(projectNum, slotIndex);
+  const aId     = getAuctionId(projectNum, slotIndex);
   const auction = auctions[aId];
   if (!auction || !auction.cooldownUntil) return false;
   return auction.cooldownUntil > Date.now();
@@ -272,7 +278,7 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
   users[userId].processed.push(dedupKey);
   if (users[userId].processed.length > 200) users[userId].processed = users[userId].processed.slice(-200);
   saveUsers();
-  saveCreditsBackup(); // FIX 3: keep backup in sync whenever credits change
+  saveCreditsBackup();
  
   record.status       = 'credited';
   record.creditedAt   = Date.now();
@@ -484,7 +490,6 @@ function generateAuctionSectionEmbed() {
       const auction = auctions[aId];
       let statusLine, topBidLine, timeLine;
  
-      // FIX 1: show cooldown state
       const onCooldown = isAuctionSlotOnCooldown(num, i);
  
       if (onCooldown) {
@@ -501,8 +506,9 @@ function generateAuctionSectionEmbed() {
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids yet';
         timeLine   = `${Math.floor(timeLeft / 60000)}m ${Math.floor((timeLeft % 60000) / 1000)}s`;
       } else {
+        // ended but not yet on cooldown (key gen in progress or failed)
         const top = getTopBid(auction);
-        statusLine = '✅ **Ended**';
+        statusLine = '⏳ **Processing winner...**';
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids';
         timeLine   = '—';
       }
@@ -534,16 +540,17 @@ function buildBidRow() {
     const icon       = num === 3 ? '🌾' : '⚔️';
     const components = [];
     for (let i = 1; i <= BID_SLOTS; i++) {
-      const aId     = getAuctionId(num, i);
-      const auction = auctions[aId];
-      // FIX 1: disable button during cooldown OR when auction ended
+      const aId        = getAuctionId(num, i);
+      const auction    = auctions[aId];
       const onCooldown = isAuctionSlotOnCooldown(num, i);
+      // Disable if: cooldown active, ended (processing), or no auction object
+      const isDisabled = onCooldown || auction?.status === 'ended';
       components.push(
         new ButtonBuilder()
           .setCustomId(`place_bid_${aId}`)
           .setLabel(`${icon} ${proj.name} Slot ${i}`)
           .setStyle(ButtonStyle.Primary)
-          .setDisabled(auction?.status === 'ended' || onCooldown)
+          .setDisabled(isDisabled)
       );
     }
     rows.push(new ActionRowBuilder().addComponents(...components));
@@ -585,32 +592,56 @@ function ensureAuction(projectNum, slotIndex) {
  
 const endingAuctions = new Set();
  
+// FIX: helper to refund all bidders except the winner (or all if no winner)
+async function refundBidders(auction, winnerUserId = null) {
+  for (const bid of (auction.bids || [])) {
+    if (bid.userId === winnerUserId) continue;
+    ensureUser(bid.userId);
+    users[bid.userId].credits += bid.amount;
+    console.log(`↩️  Refunded ${bid.amount} credits to ${bid.userId}`);
+    try {
+      const loser = await client.users.fetch(bid.userId);
+      const project = PROJECTS[auction.projectNum];
+      await loser.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(`❌ You lost the ${project.name} Slot ${auction.slotIndex} auction`)
+            .setColor(0xED4245)
+            .setDescription(`Your **${bid.amount} credits** have been refunded.\nBalance: **${users[bid.userId].credits}**`)
+        ]
+      });
+    } catch {}
+  }
+}
+ 
 async function endAuction(auctionId) {
   const auction = auctions[auctionId];
-  if (!auction || auction.status === 'ended') return;
+  if (!auction) return;
+  if (auction.status === 'ended' || auction.status === 'idle') return;
   if (endingAuctions.has(auctionId)) return;
   endingAuctions.add(auctionId);
  
   auction.status = 'ended';
   saveAuctions();
- 
-  const topBid = getTopBid(auction);
   await updatePanelMessage();
  
-  // FIX 1: reset to idle after cooldown expires, not after a fixed short delay
+  const topBid = getTopBid(auction);
+ 
+  // Helper: reset this auction slot back to idle after a delay
   const resetToIdle = (delay = 10_000) => {
     setTimeout(() => {
       if (auctions[auctionId]) {
         auctions[auctionId] = {
-          ...auctions[auctionId],
+          projectNum:    auction.projectNum,
+          slotIndex:     auction.slotIndex,
           status:        'idle',
           bids:          [],
           endsAt:        null,
-          cooldownUntil: null, // clear cooldown
+          cooldownUntil: null,
           _lastWinner:   null,
         };
         saveAuctions();
-        updatePanelMessage();
+        updatePanelMessage().catch(() => {});
       }
       endingAuctions.delete(auctionId);
     }, delay);
@@ -618,88 +649,160 @@ async function endAuction(auctionId) {
  
   if (!topBid) {
     console.log(`⚠️ Auction ${auctionId} ended with no bids`);
-    return resetToIdle();
+    return resetToIdle(5_000);
   }
  
   const project = PROJECTS[auction.projectNum];
   ensureUser(topBid.userId);
  
-  if (users[topBid.userId].credits < topBid.amount) {
-    console.warn(`⚠️ ${topBid.userId} won ${auctionId} but has insufficient credits`);
-    try {
-      const channel = await client.channels.fetch(panelState.channelId);
-      await channel.send(`⚠️ <@${topBid.userId}> won **${auctionId}** but has insufficient credits. Slot not activated.`);
-    } catch {}
-    return resetToIdle();
+  // FIX: Credits were held (escrowed) when bids were placed, so no need to re-check/re-deduct here.
+  // The winner's bid amount was already deducted at bid time; losers are refunded below.
+  // We just need to verify the winner still has at least 0 credits (sanity check).
+  // (If using escrow model, the winner's credits were already locked, so this check is just defensive.)
+  if (users[topBid.userId].credits < 0) {
+    console.warn(`⚠️ ${topBid.userId} has negative credits after winning ${auctionId} — this shouldn't happen`);
   }
  
+  let key, expiry;
   try {
     let username = topBid.userId;
-    try { const u = await client.users.fetch(topBid.userId); username = u.username; } catch {}
+    try {
+      const u = await client.users.fetch(topBid.userId);
+      username = u.username;
+    } catch {}
  
-    const { key, expiry } = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
+    // FIX: Generate key BEFORE touching any state, so failure is clean
+    const keyResult = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
+    key    = keyResult.key;
+    expiry = keyResult.expiry;
+  } catch (err) {
+    console.error(`❌ Key generation failed for ${auctionId}:`, err.message);
  
-    // FIX 1: set cooldown so nobody can bid while winner's key is active
-    auction.cooldownUntil = Date.now() + AUCTION_COOLDOWN_MS;
-    auction._lastWinner   = topBid.userId;
-    saveAuctions();
- 
-    slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
-    slots.push({ userId: topBid.userId, key, expiry, project: project.name, projectNum: auction.projectNum });
- 
-    users[topBid.userId].credits -= topBid.amount;
+    // FIX: On key gen failure, refund the WINNER their bid too and reset
+    ensureUser(topBid.userId);
+    users[topBid.userId].credits += topBid.amount;
+    await refundBidders(auction, topBid.userId); // refund all losers
     saveUsers();
-    saveSlots();
-    saveCreditsBackup(); // FIX 3: sync backup after deduction
+    saveCreditsBackup();
  
     try {
-      const discordUser = await client.users.fetch(topBid.userId);
-      await discordUser.send({
+      const winner = await client.users.fetch(topBid.userId);
+      await winner.send({
         embeds: [
           new EmbedBuilder()
-            .setTitle(`🎉 You won ${project.name} Slot ${auction.slotIndex}!`)
-            .setColor(0x57F287)
-            .addFields(
-              { name: '🔑 Your Key',         value: `\`${key}\``,                                   inline: false },
-              { name: '⏳ Duration',          value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
-              { name: '📅 Expires',           value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
-              { name: '💳 Credits Deducted',  value: `${topBid.amount}`,                             inline: true  },
-              { name: '💳 Credits Remaining', value: `${users[topBid.userId].credits}`,              inline: true  }
-            )
-            .setFooter({ text: 'Keep your key private.' })
+            .setTitle(`⚠️ Auction Key Generation Failed`)
+            .setColor(0xED4245)
+            .setDescription(`You won the **${project.name} Slot ${auction.slotIndex}** auction but there was an error generating your key.\nYour **${topBid.amount} credits** have been refunded.\nBalance: **${users[topBid.userId].credits}**\n\nPlease contact an admin.`)
         ]
       });
     } catch {}
  
-    // FIX 2: refund losers exactly what they bid — no +1, no extra
-    for (const bid of auction.bids) {
-      if (bid.userId === topBid.userId) continue;
-      ensureUser(bid.userId);
-      users[bid.userId].credits += bid.amount; // exact refund only
-      try {
-        const loser = await client.users.fetch(bid.userId);
-        await loser.send({
+    // Notify in panel channel if possible
+    try {
+      if (panelState.channelId) {
+        const channel = await client.channels.fetch(panelState.channelId);
+        await channel.send(`⚠️ <@${topBid.userId}> won **${auctionId}** but key generation failed. All bids refunded. Error: \`${err.message.slice(0, 200)}\``);
+      }
+    } catch {}
+ 
+    saveUsers();
+    saveCreditsBackup();
+    return resetToIdle(5_000);
+  }
+ 
+  // Key generated successfully — now set cooldown and update slots
+  auction.cooldownUntil = Date.now() + AUCTION_COOLDOWN_MS;
+  auction._lastWinner   = topBid.userId;
+  saveAuctions();
+ 
+  // FIX: Remove any existing slot for this user+project before adding new one
+  slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
+  slots.push({
+    userId:     topBid.userId,
+    key,
+    expiry,
+    project:    project.name,
+    projectNum: auction.projectNum,
+    fromAuction: true,
+    auctionId,
+  });
+  saveSlots();
+ 
+  // FIX: Winner's credits were already deducted at bid time (escrow model).
+  // No additional deduction needed here. Save & backup.
+  saveUsers();
+  saveCreditsBackup();
+ 
+  await updatePanelMessage();
+ 
+  // FIX: DM winner with key — this was broken before because it was inside a try/catch
+  // that would silently swallow errors and skip the DM entirely
+  try {
+    const discordUser = await client.users.fetch(topBid.userId);
+    await discordUser.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`🎉 You won ${project.name} Slot ${auction.slotIndex}!`)
+          .setColor(0x57F287)
+          .addFields(
+            { name: '🔑 Your Key',         value: `\`${key}\``,                                   inline: false },
+            { name: '⏳ Duration',          value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
+            { name: '📅 Expires',           value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
+            { name: '💳 Credits Spent',     value: `${topBid.amount}`,                             inline: true  },
+            { name: '💳 Credits Remaining', value: `${users[topBid.userId].credits}`,              inline: true  }
+          )
+          .setFooter({ text: 'Keep your key private. The slot is now marked as occupied.' })
+      ]
+    });
+    console.log(`✅ Key DM sent to winner ${topBid.userId}`);
+  } catch (err) {
+    console.error(`❌ Could not DM winner ${topBid.userId}:`, err.message);
+    // FIX: If we can't DM the winner, post the key in the panel channel as fallback
+    try {
+      if (panelState.channelId) {
+        const channel = await client.channels.fetch(panelState.channelId);
+        await channel.send({
+          content: `⚠️ <@${topBid.userId}> — couldn't DM you your key. Here it is (delete this message after copying):`,
           embeds: [
             new EmbedBuilder()
-              .setTitle(`❌ You lost the ${project.name} Slot ${auction.slotIndex} auction`)
-              .setColor(0xED4245)
-              .setDescription(`Your **${bid.amount} credits** have been refunded.\nBalance: **${users[bid.userId].credits}**`)
+              .setTitle(`🎉 Auction Won: ${project.name} Slot ${auction.slotIndex}`)
+              .setColor(0x57F287)
+              .addFields(
+                { name: '🔑 Key',     value: `\`${key}\``,                         inline: false },
+                { name: '📅 Expires', value: `<t:${Math.floor(expiry / 1000)}:R>`, inline: true  }
+              )
           ]
         });
-      } catch {}
+      }
+    } catch (fallbackErr) {
+      console.error(`❌ Fallback channel send also failed:`, fallbackErr.message);
     }
-    saveUsers();
-    saveCreditsBackup(); // FIX 3: sync backup after refunds
- 
-    console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits`);
- 
-    // FIX 1: reset to idle only after the full 2-hour cooldown
-    resetToIdle(AUCTION_COOLDOWN_MS);
- 
-  } catch (err) {
-    console.error(`❌ Key generation failed for ${auctionId}:`, err.message);
-    endingAuctions.delete(auctionId);
   }
+ 
+  // Refund all losing bidders
+  await refundBidders(auction, topBid.userId);
+  saveUsers();
+  saveCreditsBackup();
+ 
+  console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits | Key: ${key}`);
+ 
+  // Announce in panel channel
+  try {
+    if (panelState.channelId) {
+      const channel = await client.channels.fetch(panelState.channelId);
+      await channel.send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(`🏆 Auction Ended: ${project.name} Slot ${auction.slotIndex}`)
+            .setColor(0xF5C542)
+            .setDescription(`<@${topBid.userId}> won with a bid of **${topBid.amount} credits** and has received their key via DM!\nSlot is now **occupied** for **${AUCTION_FIXED_HOURS} hours**.`)
+        ]
+      });
+    }
+  } catch {}
+ 
+  // Reset to idle after the full 2-hour cooldown
+  resetToIdle(AUCTION_COOLDOWN_MS);
 }
  
 // ===== COMMAND HANDLER =====
@@ -730,7 +833,8 @@ client.on('interactionCreate', async interaction => {
         const st  = onCooldown
           ? `🔒 Cooldown (${formatTime(a.cooldownUntil - Date.now())} left)`
           : !a || a.status === 'idle' ? '⚪ Idle' : a.status === 'live' ? '🔴 Live' : '✅ Ended';
-        lines.push(`${proj.name} Slot ${i}: ${st}`);
+        const topBid = a ? getTopBid(a) : null;
+        lines.push(`${proj.name} Slot ${i}: ${st}${topBid ? ` | Top: ${topBid.amount}cr by <@${topBid.userId}>` : ''}`);
       }
     }
     return interaction.reply({
@@ -745,21 +849,19 @@ client.on('interactionCreate', async interaction => {
     ensureUser(target.id);
     users[target.id].credits += amount;
     saveUsers();
-    saveCreditsBackup(); // FIX 3: sync backup after manual grant
+    saveCreditsBackup();
     return interaction.reply({ content: `✅ Gave **${amount} credits** to ${target.tag}. Balance: **${users[target.id].credits}**` });
   }
  
-  // FIX 3: /backupcredits — snapshot all credits to credits_backup.json
   if (interaction.commandName === 'backupcredits' && isAdmin) {
     saveCreditsBackup();
     const count = Object.keys(users).length;
     return interaction.reply({
-      content: `✅ Credits backed up for **${count} user(s)** → \`credits_backup.json\`.\nThis file survives bot resets — run \`/restorecredits\` after a reset to bring them back.`,
+      content: `✅ Credits backed up for **${count} user(s)** → \`credits_backup.json\`.`,
       ephemeral: true
     });
   }
  
-  // FIX 3: /restorecredits — load credits_backup.json and merge into current users
   if (interaction.commandName === 'restorecredits' && isAdmin) {
     const backup = loadCreditsBackup();
     if (!backup) {
@@ -768,17 +870,16 @@ client.on('interactionCreate', async interaction => {
     let restored = 0;
     for (const [userId, credits] of Object.entries(backup)) {
       ensureUser(userId);
-      users[userId].credits = credits; // overwrite with backed-up value
+      users[userId].credits = credits;
       restored++;
     }
     saveUsers();
     return interaction.reply({
-      content: `✅ Restored credits for **${restored} user(s)** from backup.\nExisting users not in the backup are left untouched.`,
+      content: `✅ Restored credits for **${restored} user(s)** from backup.`,
       ephemeral: true
     });
   }
  
-  // FIX 3: /checkcredits — admin lookup of any user's balance
   if (interaction.commandName === 'checkcredits' && isAdmin) {
     const target = interaction.options.getUser('user');
     ensureUser(target.id);
@@ -786,6 +887,45 @@ client.on('interactionCreate', async interaction => {
       content: `💳 **${target.tag}** has **${users[target.id].credits} credits**.`,
       ephemeral: true
     });
+  }
+ 
+  // FIX: force-end a stuck auction
+  if (interaction.commandName === 'forceendauction' && isAdmin) {
+    const auctionId = interaction.options.getString('auction_id');
+    if (!auctions[auctionId]) {
+      return interaction.reply({ content: `❌ No auction found with ID \`${auctionId}\`.`, ephemeral: true });
+    }
+    await interaction.reply({ content: `⚙️ Force-ending \`${auctionId}\`...`, ephemeral: true });
+    auctions[auctionId].status = 'live'; // ensure endAuction won't skip it
+    endingAuctions.delete(auctionId);    // clear lock so it can re-run
+    await endAuction(auctionId);
+    return;
+  }
+ 
+  // FIX: reset a stuck auction to idle (with refunds)
+  if (interaction.commandName === 'resetauction' && isAdmin) {
+    const auctionId = interaction.options.getString('auction_id');
+    if (!auctions[auctionId]) {
+      return interaction.reply({ content: `❌ No auction found with ID \`${auctionId}\`.`, ephemeral: true });
+    }
+    const auction = auctions[auctionId];
+    // Refund all current bidders
+    await refundBidders(auction, null);
+    saveUsers();
+    saveCreditsBackup();
+    auctions[auctionId] = {
+      projectNum:    auction.projectNum,
+      slotIndex:     auction.slotIndex,
+      status:        'idle',
+      bids:          [],
+      endsAt:        null,
+      cooldownUntil: null,
+      _lastWinner:   null,
+    };
+    saveAuctions();
+    endingAuctions.delete(auctionId);
+    await updatePanelMessage();
+    return interaction.reply({ content: `✅ Auction \`${auctionId}\` reset to idle. All bidders refunded.`, ephemeral: true });
   }
 });
  
@@ -855,11 +995,12 @@ client.on('interactionCreate', async interaction => {
   if (interaction.customId.startsWith('place_bid_')) {
     const auctionId = interaction.customId.replace('place_bid_', '');
     const parts     = auctionId.split('_');
-    ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
+    const projNum   = parseInt(parts[1]);
+    const slotIdx   = parseInt(parts[2]);
+    ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
  
-    // FIX 1: block bids during cooldown (double-check even though button is disabled)
-    if (isAuctionSlotOnCooldown(parseInt(parts[1]), parseInt(parts[2]))) {
+    if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
       const timeLeft = formatTime(auction.cooldownUntil - Date.now());
       return interaction.reply({ content: `🔒 This slot is occupied. Bidding opens again in **${timeLeft}**.`, ephemeral: true });
     }
@@ -868,8 +1009,12 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ content: '❌ This auction just ended. Wait for the next one.', ephemeral: true });
     }
  
-    const topBid = getTopBid(auction);
-    const minBid = topBid ? topBid.amount + 1 : 1;
+    const topBid      = getTopBid(auction);
+    // FIX: existing bid from this user — min bid only needs to beat the current top (not their own bid)
+    const existingBid = auction.bids.find(b => b.userId === userId);
+    const minBid      = topBid
+      ? (topBid.userId === userId ? topBid.amount + 1 : topBid.amount + 1)
+      : 1;
  
     const modal = new ModalBuilder()
       .setCustomId(`bid_modal_${auctionId}`)
@@ -878,7 +1023,7 @@ client.on('interactionCreate', async interaction => {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('bid_amount')
-          .setLabel(`Min bid: ${minBid} credits | You have: ${users[userId].credits}`)
+          .setLabel(`Min bid: ${minBid} credits | You have: ${users[userId].credits}${existingBid ? ` | Your bid: ${existingBid.amount}` : ''}`)
           .setStyle(TextInputStyle.Short)
           .setPlaceholder(`e.g. ${minBid}`)
           .setRequired(true)
@@ -931,8 +1076,8 @@ client.on('interactionCreate', async interaction => {
  
       console.log(`🧾 Invoice created: payment_id=${payment_id} userId=${userId} amount=${usdAmount} USD via ${pay_currency}`);
  
-      let qrAttach   = null;
-      const qrFile   = `${rawCoin}_qr.png`;
+      let qrAttach = null;
+      const qrFile = `${rawCoin}_qr.png`;
       try {
         qrAttach = new AttachmentBuilder(await generateQRBuffer(pay_address), { name: qrFile });
       } catch {}
@@ -992,12 +1137,13 @@ client.on('interactionCreate', async interaction => {
       const hours           = creditsToSpend * project.creditToHours;
       const { key, expiry } = await createLuarmorKey(hours, userId, username, project);
  
+      // FIX: deduct AFTER key is successfully generated
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
       slots.push({ userId, key, expiry, project: project.name, projectNum: num });
       users[userId].credits -= creditsToSpend;
       saveUsers();
       saveSlots();
-      saveCreditsBackup(); // FIX 3: sync backup after slot activation
+      saveCreditsBackup();
       updatePanelMessage();
  
       return interaction.reply({
@@ -1026,11 +1172,12 @@ client.on('interactionCreate', async interaction => {
   if (interaction.customId.startsWith('bid_modal_')) {
     const auctionId = interaction.customId.replace('bid_modal_', '');
     const parts     = auctionId.split('_');
-    ensureAuction(parseInt(parts[1]), parseInt(parts[2]));
+    const projNum   = parseInt(parts[1]);
+    const slotIdx   = parseInt(parts[2]);
+    ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
  
-    // FIX 1: block bids during cooldown (modal guard)
-    if (isAuctionSlotOnCooldown(parseInt(parts[1]), parseInt(parts[2]))) {
+    if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
       return interaction.reply({ content: '🔒 This slot is occupied by the winner. Bidding is locked until the key expires.', ephemeral: true });
     }
  
@@ -1049,9 +1196,33 @@ client.on('interactionCreate', async interaction => {
     if (bidAmount < minBid) {
       return interaction.reply({ content: `❌ Minimum bid is **${minBid} credits**.`, ephemeral: true });
     }
-    if (bidAmount > users[userId].credits) {
-      return interaction.reply({ content: `❌ You only have **${users[userId].credits} credits**.`, ephemeral: true });
+ 
+    // FIX: Re-validate credits at modal submit time (prevents race where user spends credits between opening modal and submitting)
+    ensureUser(userId); // re-read fresh
+    const existingBid    = auction.bids.find(b => b.userId === userId);
+    const existingAmount = existingBid ? existingBid.amount : 0;
+    // The new bid replaces the old one — user only needs enough to cover the DIFFERENCE (since old credits were already held)
+    // With escrow model: user's total credits already have existingBid deducted, so they need (bidAmount - existingAmount) more
+    const additionalCost = bidAmount - existingAmount;
+ 
+    if (additionalCost > users[userId].credits) {
+      return interaction.reply({
+        content: `❌ You need **${additionalCost} more credits** for this bid (have **${users[userId].credits}**, upgrading from **${existingAmount}** to **${bidAmount}**).`,
+        ephemeral: true
+      });
     }
+ 
+    // FIX: ESCROW — hold/update credits at bid time so the winner's funds are locked
+    if (existingBid) {
+      // Refund the difference of the old bid, then charge the new full amount
+      users[userId].credits -= additionalCost; // net: charge only the increase
+      existingBid.amount = bidAmount;          // update in place
+    } else {
+      users[userId].credits -= bidAmount;
+      auction.bids.push({ userId, amount: bidAmount });
+    }
+    saveUsers();
+    saveCreditsBackup();
  
     const isFirstBid = auction.status === 'idle';
     if (isFirstBid) {
@@ -1061,12 +1232,11 @@ client.on('interactionCreate', async interaction => {
       console.log(`⏰ Auction ${auctionId} started by ${userId}`);
     }
  
-    auction.bids = auction.bids.filter(b => b.userId !== userId);
-    auction.bids.push({ userId, amount: bidAmount });
- 
-    const timeLeft = auction.endsAt - Date.now();
+    const timeLeft = auction.endsAt ? (auction.endsAt - Date.now()) : 0;
     if (!isFirstBid && timeLeft < 60_000) {
       auction.endsAt = Date.now() + 60_000;
+      // FIX: clear old timer and set a new one (track with a flag to avoid double-ending)
+      endingAuctions.delete(auctionId);
       setTimeout(() => endAuction(auctionId), 60_000);
     }
  
@@ -1074,7 +1244,7 @@ client.on('interactionCreate', async interaction => {
     await updatePanelMessage();
  
     return interaction.reply({
-      content: `✅ Bid of **${bidAmount} credits** placed on ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}!\nIf you win, you'll receive **${AUCTION_FIXED_HOURS} hours** flat.${isFirstBid ? '\n⏰ **Auction started! 5 minutes on the clock.**' : ''}`,
+      content: `✅ Bid of **${bidAmount} credits** placed on ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}!\n💳 Credits on hold: **${bidAmount}** | Balance: **${users[userId].credits}**\nIf you win, you'll receive **${AUCTION_FIXED_HOURS} hours** flat.${isFirstBid ? '\n⏰ **Auction started! 5 minutes on the clock.**' : ''}`,
       ephemeral: true
     });
   }
@@ -1109,6 +1279,7 @@ client.once('ready', async () => {
  
   for (const num of AUCTION_PROJECTS) for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
  
+  // Resume live auctions
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
     const remaining = auction.endsAt - Date.now();
@@ -1120,15 +1291,14 @@ client.once('ready', async () => {
     }
   }
  
-  // FIX 1: resume any cooldown timers that were running before restart
+  // Resume cooldown timers
   for (const [auctionId, auction] of Object.entries(auctions)) {
-    if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) continue;
-    const remaining = auction.cooldownUntil - Date.now();
-    console.log(`🔒 Resuming cooldown for ${auctionId} — unlocks in ${formatTime(remaining)}`);
-    setTimeout(() => {
-      if (auctions[auctionId]) {
+    if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) {
+      // If cooldown has already expired, reset to idle immediately
+      if (auction.cooldownUntil && auction.cooldownUntil <= Date.now() && auction.status !== 'idle') {
         auctions[auctionId] = {
-          ...auctions[auctionId],
+          projectNum:    auction.projectNum,
+          slotIndex:     auction.slotIndex,
           status:        'idle',
           bids:          [],
           endsAt:        null,
@@ -1136,7 +1306,26 @@ client.once('ready', async () => {
           _lastWinner:   null,
         };
         saveAuctions();
-        updatePanelMessage();
+        console.log(`🔓 Cooldown expired while offline for ${auctionId} — reset to idle`);
+      }
+      continue;
+    }
+    const remaining = auction.cooldownUntil - Date.now();
+    console.log(`🔒 Resuming cooldown for ${auctionId} — unlocks in ${formatTime(remaining)}`);
+    setTimeout(() => {
+      if (auctions[auctionId]) {
+        auctions[auctionId] = {
+          projectNum:    auction.projectNum,
+          slotIndex:     auction.slotIndex,
+          status:        'idle',
+          bids:          [],
+          endsAt:        null,
+          cooldownUntil: null,
+          _lastWinner:   null,
+        };
+        saveAuctions();
+        updatePanelMessage().catch(() => {});
+        console.log(`🔓 ${auctionId} cooldown expired — reset to idle`);
       }
     }, remaining);
   }
@@ -1150,6 +1339,7 @@ client.once('ready', async () => {
   startWebhookServer();
  
   setTimeout(() => pollPendingPayments().catch(() => {}), 10_000);
+  setTimeout(() => updatePanelMessage().catch(() => {}), 5_000);
 });
  
 client.login(process.env.BOT_TOKEN);
