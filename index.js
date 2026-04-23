@@ -30,26 +30,44 @@ const AUCTIONS_FILE       = './auctions.json';
 const PANEL_STATE_FILE    = './panel_state.json';
 const PAYMENTS_FILE       = './payments.json';
 const CREDITS_BACKUP_FILE = './credits_backup.json';
+const PAUSE_STATE_FILE    = './pause_state.json';
  
 let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
 let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
 let auctions   = fs.existsSync(AUCTIONS_FILE)    ? JSON.parse(fs.readFileSync(AUCTIONS_FILE))    : {};
 let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
 let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PAYMENTS_FILE))    : {};
+let pauseState = fs.existsSync(PAUSE_STATE_FILE) ? JSON.parse(fs.readFileSync(PAUSE_STATE_FILE)) : { paused: false, pausedAt: null };
  
 // ===== PROJECT CONFIG =====
+// Basic:   1 credit = 1 hour, minimum 3 credits (3 hours)
+// Premium: 3 credits = 1 hour (i.e. 1 credit = 1/3 hour), minimum 1 credit (1/3 hour → so min spend = 1 credit = 20min, but requirement says "minimum 1 hour" → min credits = 3)
+// Per requirement: Basic = 1cr/hr (min 3 credits), Premium = 3cr/hr (min 1 credit)
 const PROJECTS = {
-  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditToHours: 2, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
-  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditToHours: 1, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
-  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditToHours: 2, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
-  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditToHours: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 1, minCredits: 3, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
+  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 3, minCredits: 1, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
+  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
 };
+
+// Basic: credits × 1 = hours
+// Premium: credits ÷ 3 = hours
+function creditsToHours(projectNum, credits) {
+  const proj = PROJECTS[projectNum];
+  return credits / proj.creditsPerHour;
+}
  
 const AUCTION_PROJECTS      = [3, 4];
 const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
 const AUCTION_FIXED_HOURS   = 2;
 const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000;
+
+// Minimum bids per auction project
+const AUCTION_MIN_BID = {
+  3: 2,  // Farmer: minimum 2 credits
+  4: 6,  // Main: minimum 6 credits
+};
  
 const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || `http://localhost:${WEBHOOK_PORT}`;
@@ -59,11 +77,12 @@ const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
 const NOWPAYMENTS_BASE       = 'https://api.nowpayments.io/v1';
  
 // ===== SAVE FUNCTIONS =====
-function saveUsers()     { fs.writeFileSync(USERS_FILE,       JSON.stringify(users,      null, 2)); }
-function saveSlots()     { fs.writeFileSync(SLOTS_FILE,       JSON.stringify(slots,      null, 2)); }
-function saveAuctions()  { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(auctions,   null, 2)); }
-function savePanelState(){ fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
-function savePayments()  { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
+function saveUsers()      { fs.writeFileSync(USERS_FILE,       JSON.stringify(users,      null, 2)); }
+function saveSlots()      { fs.writeFileSync(SLOTS_FILE,       JSON.stringify(slots,      null, 2)); }
+function saveAuctions()   { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(auctions,   null, 2)); }
+function savePanelState() { fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
+function savePayments()   { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
+function savePauseState() { fs.writeFileSync(PAUSE_STATE_FILE, JSON.stringify(pauseState, null, 2)); }
  
 function saveCreditsBackup() {
   const backup = {};
@@ -79,7 +98,7 @@ function loadCreditsBackup() {
  
 // ===== COMMANDS =====
 const commands = [
-  new SlashCommandBuilder().setName('panel').setDescription('Open slot panel'),
+  new SlashCommandBuilder().setName('panel').setDescription('Open the Lion Notifier slot panel'),
   new SlashCommandBuilder().setName('bidpanel').setDescription('Show auction status (admin)'),
   new SlashCommandBuilder()
     .setName('givecredits')
@@ -96,16 +115,21 @@ const commands = [
     .setName('checkcredits')
     .setDescription('(Admin) Check a user\'s current credit balance')
     .addUserOption(opt => opt.setName('user').setDescription('User').setRequired(true)),
-  // FIX: admin command to force-end a stuck auction
   new SlashCommandBuilder()
     .setName('forceendauction')
     .setDescription('(Admin) Force-end a stuck auction')
     .addStringOption(opt => opt.setName('auction_id').setDescription('e.g. auction_3_1').setRequired(true)),
-  // FIX: admin command to reset a stuck auction to idle
   new SlashCommandBuilder()
     .setName('resetauction')
     .setDescription('(Admin) Reset an auction slot to idle (refunds all bidders)')
     .addStringOption(opt => opt.setName('auction_id').setDescription('e.g. auction_3_1').setRequired(true)),
+  // PAUSE / UNPAUSE
+  new SlashCommandBuilder()
+    .setName('pause')
+    .setDescription('(Admin) Pause the slot system — stops slot countdowns and new purchases'),
+  new SlashCommandBuilder()
+    .setName('unpause')
+    .setDescription('(Admin) Unpause the slot system — adds paused time to all active Luarmor keys'),
 ].map(c => c.toJSON());
  
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -128,6 +152,56 @@ function ensureUser(userId) {
   if (!users[userId]) users[userId] = { credits: 0, processed: [] };
   if (!Array.isArray(users[userId].processed)) users[userId].processed = [];
 }
+
+// ===== PAUSE HELPERS =====
+function isSystemPaused() { return !!pauseState.paused; }
+
+async function pauseSystem() {
+  if (pauseState.paused) return false;
+  pauseState.paused   = true;
+  pauseState.pausedAt = Date.now();
+  savePauseState();
+  console.log(`⏸️  System paused at ${new Date().toISOString()}`);
+  return true;
+}
+
+async function unpauseSystem() {
+  if (!pauseState.paused) return { success: false };
+  const pausedDuration = Date.now() - pauseState.pausedAt;
+  pauseState.paused   = false;
+  const pausedAt      = pauseState.pausedAt;
+  pauseState.pausedAt = null;
+  savePauseState();
+  console.log(`▶️  System unpaused — paused for ${formatTime(pausedDuration)}`);
+
+  // Extend all active slots by the paused duration
+  let extended = 0;
+  for (const slot of slots) {
+    if (slot && slot.expiry > pausedAt) {
+      slot.expiry += pausedDuration;
+      extended++;
+      // Also extend the Luarmor key via API
+      try {
+        const project  = PROJECTS[slot.projectNum];
+        const newExpiry = Math.floor(slot.expiry / 1000);
+        // Luarmor API: update the user's auth_expire
+        const identifier = slot.luarmorIdentifier || null;
+        if (project && slot.userId && identifier) {
+          await axios.patch(
+            `https://api.luarmor.net/v3/projects/${project.id}/users`,
+            { identifier, auth_expire: newExpiry },
+            { headers: { Authorization: project.apiKey, 'Content-Type': 'application/json' } }
+          ).catch(e => console.warn(`⚠️  Luarmor extend failed for ${slot.userId}: ${e.message}`));
+        }
+      } catch (e) {
+        console.warn(`⚠️  Could not extend Luarmor key for slot ${slot.userId}:`, e.message);
+      }
+    }
+  }
+  saveSlots();
+  console.log(`✅ Extended ${extended} active slot(s) by ${formatTime(pausedDuration)}`);
+  return { success: true, pausedDuration, extended };
+}
  
 // ===== LUARMOR KEY GENERATOR =====
 async function createLuarmorKey(hours, discordId, username, project) {
@@ -148,7 +222,7 @@ async function createLuarmorKey(hours, discordId, username, project) {
     };
     const key = findKey(res.data);
     if (!key) throw new Error(`No key found in response: ${JSON.stringify(res.data)}`);
-    return { key, expiry: expiryUnix * 1000 };
+    return { key, expiry: expiryUnix * 1000, identifier };
   } catch (err) {
     const errorData = err.response?.data || err.message;
     throw new Error(typeof errorData === 'string' ? errorData : JSON.stringify(errorData, null, 2));
@@ -178,6 +252,14 @@ function isAuctionSlotOnCooldown(projectNum, slotIndex) {
 // ===== QR CODE =====
 async function generateQRBuffer(text) {
   return QRCode.toBuffer(text, { type: 'png', width: 200, margin: 2 });
+}
+
+// ===== STATUS BADGE HELPERS =====
+function slotStatusBadge(active, max) {
+  const pct = active / max;
+  if (pct >= 1)   return '🔴';
+  if (pct >= 0.7) return '🟡';
+  return '🟢';
 }
  
 // ========================================
@@ -292,16 +374,17 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
     await discordUser.send({
       embeds: [
         new EmbedBuilder()
-          .setTitle('💰 Payment Confirmed!')
+          .setTitle('💰 Payment Confirmed')
           .setColor(0x57F287)
-          .setDescription('Your crypto payment has been confirmed and credits have been added to your account.')
+          .setDescription('Your crypto payment has been verified and credits have landed in your account.')
           .addFields(
-            { name: '🪙 Coin',          value: (payCurrency || 'crypto').toUpperCase(), inline: true },
-            { name: '💵 USD Value',     value: `~$${usdValue.toFixed(2)}`,              inline: true },
-            { name: '✅ Credits Added', value: `**${credits}**`,                         inline: true },
-            { name: '💳 New Balance',   value: `**${users[userId].credits}**`,           inline: true },
+            { name: '🪙 Coin',           value: (payCurrency || 'crypto').toUpperCase(), inline: true },
+            { name: '💵 USD Value',      value: `~$${usdValue.toFixed(2)}`,              inline: true },
+            { name: '✅ Credits Added',  value: `**+${credits}**`,                        inline: true },
+            { name: '💳 New Balance',    value: `**${users[userId].credits} credits**`,  inline: true },
           )
-          .setFooter({ text: 'Credits are rounded down to the nearest dollar.' })
+          .setFooter({ text: 'Credits are rounded down to the nearest dollar  •  Lion Notifier' })
+          .setTimestamp()
       ]
     });
   } catch (err) {
@@ -433,30 +516,58 @@ async function processWebhookBody(body, headers) {
 function generatePanelEmbed() {
   const basicActive   = getActiveSlots(1);
   const premiumActive = getActiveSlots(2);
-  return new EmbedBuilder()
-    .setTitle('🦁 Lion Notifier — Slot System')
-    .setColor(0xF5C542)
-    .setDescription('**$1 = 1 Credit** — Payments are processed automatically.')
+  const paused = isSystemPaused();
+
+  const embed = new EmbedBuilder()
+    .setTitle('🦁 Lion Notifier — Slot Panel')
+    .setColor(paused ? 0xED4245 : 0xF5C542)
+    .setDescription(
+      (paused
+        ? '> ⏸️  **System is currently paused.** Purchases & slot countdowns are frozen.\n> Crypto payments continue processing normally.\n\n'
+        : '') +
+      '**$1 = 1 Credit** — All payments are processed automatically via crypto.'
+    )
     .addFields(
       {
-        name: '🔵 Basic',
-        value: [`> **1 Credit = 2 Hours**`, `> Slots: **${basicActive}/${PROJECTS[1].maxSlots}**`, `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 Full' : '🟢 Available'}`].join('\n'),
+        name: '🔵 Basic Plan',
+        value: [
+          `> 💰 **1 credit = 1 hour**`,
+          `> ⏱️  Minimum purchase: **3 credits (3h)**`,
+          `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
+          `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+        ].join('\n'),
         inline: true
       },
       {
-        name: '🟣 Premium',
-        value: [`> **1 Credit = 1 Hour**`, `> Slots: **${premiumActive}/${PROJECTS[2].maxSlots}**`, `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 Full' : '🟢 Available'}`].join('\n'),
+        name: '🟣 Premium Plan',
+        value: [
+          `> 💰 **3 credits = 1 hour**`,
+          `> ⏱️  Minimum purchase: **1 credit**`,
+          `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
+          `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+        ].join('\n'),
         inline: true
       }
     )
-    .setFooter({ text: 'Use buttons below to activate a slot or buy credits.' })
+    .setFooter({ text: paused ? '⏸️  SYSTEM PAUSED  •  Lion Notifier' : 'Use the buttons below to activate a slot or top up credits  •  Lion Notifier' })
     .setTimestamp();
+
+  return embed;
 }
  
 // ===== SLOTS EMBED =====
 function generateSlotsEmbed() {
   const now = Date.now();
-  const embed = new EmbedBuilder().setTitle('📊 Live Slot Overview').setColor(0x5865F2).setTimestamp();
+  const paused = isSystemPaused();
+  const embed = new EmbedBuilder()
+    .setTitle('📊 Live Slot Overview')
+    .setColor(paused ? 0x99AAB5 : 0x5865F2)
+    .setTimestamp();
+
+  if (paused) {
+    embed.setDescription('⏸️  **Countdowns are frozen** — all expiry times are extended when the system unpauses.');
+  }
+
   for (const [num, proj] of Object.entries(PROJECTS)) {
     if (AUCTION_PROJECTS.includes(Number(num))) continue;
     const active = slots.filter(s => s?.projectNum === Number(num) && s.expiry > now);
@@ -464,11 +575,11 @@ function generateSlotsEmbed() {
     for (let i = 0; i < proj.maxSlots; i++) {
       const slot = active[i];
       val += slot
-        ? `🔴 Slot ${i + 1} — <@${slot.userId}> | expires in ${formatTime(slot.expiry - now)}\n`
-        : `🟢 Slot ${i + 1} — Available\n`;
+        ? `🔴 **Slot ${i + 1}** — <@${slot.userId}> · expires ${paused ? '(paused)' : `<t:${Math.floor(slot.expiry / 1000)}:R>`}\n`
+        : `🟢 **Slot ${i + 1}** — Available\n`;
     }
     const icon = num === '1' ? '🔵' : '🟣';
-    embed.addFields({ name: `${icon} ${proj.name} (${active.length}/${proj.maxSlots})`, value: val || 'No slots.', inline: false });
+    embed.addFields({ name: `${icon} ${proj.name} (${active.length}/${proj.maxSlots})`, value: val || 'No active slots.', inline: false });
   }
   return embed;
 }
@@ -476,15 +587,23 @@ function generateSlotsEmbed() {
 // ===== AUCTION EMBED =====
 function generateAuctionSectionEmbed() {
   const now = Date.now();
+  const paused = isSystemPaused();
   const embed = new EmbedBuilder()
     .setTitle('🏷️ Bid Slots — Farmer & Main')
-    .setColor(0xF5C542)
-    .setDescription(`Bid slots start automatically when the first bid is placed. Auction lasts **5 minutes** from first bid.\nWinner always receives **${AUCTION_FIXED_HOURS} hours** flat — highest bid wins.\n\u200b`)
+    .setColor(paused ? 0x99AAB5 : 0xF5C542)
+    .setDescription(
+      `Auctions start when the **first bid** is placed and run for **${AUCTION_DURATION_MINS} minutes**.\n` +
+      `The winner receives **${AUCTION_FIXED_HOURS} hours** flat — highest bid takes the slot.\n\n` +
+      `> 🌾 **Farmer** minimum bid: **2 credits**\n` +
+      `> ⚔️ **Main** minimum bid: **6 credits**\n\u200b`
+    )
     .setTimestamp();
  
   for (const num of AUCTION_PROJECTS) {
     const proj = PROJECTS[num];
     const icon = num === 3 ? '🌾' : '⚔️';
+    const minBid = AUCTION_MIN_BID[num];
+
     for (let i = 1; i <= BID_SLOTS; i++) {
       const aId     = getAuctionId(num, i);
       const auction = auctions[aId];
@@ -494,28 +613,34 @@ function generateAuctionSectionEmbed() {
  
       if (onCooldown) {
         const timeLeft = Math.max(0, auction.cooldownUntil - now);
-        statusLine = '🔒 **Occupied** (winner\'s key active)';
+        statusLine = '🔒 **Occupied** — key active';
         topBidLine = auction._lastWinner ? `<@${auction._lastWinner}>` : '—';
-        timeLine   = `unlocks in ${formatTime(timeLeft)}`;
+        timeLine   = `unlocks <t:${Math.floor(auction.cooldownUntil / 1000)}:R>`;
       } else if (!auction || auction.status === 'idle') {
-        statusLine = '⚪ **Waiting for first bid**'; topBidLine = 'No bids yet'; timeLine = '—';
+        statusLine = '⚪ **Open** — waiting for first bid';
+        topBidLine = `No bids yet (min **${minBid} cr**)`;
+        timeLine   = '—';
       } else if (auction.status === 'live') {
         const timeLeft = Math.max(0, auction.endsAt - now);
         const top = getTopBid(auction);
-        statusLine = '🔴 **Live**';
+        statusLine = '🔴 **Live Auction**';
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids yet';
-        timeLine   = `${Math.floor(timeLeft / 60000)}m ${Math.floor((timeLeft % 60000) / 1000)}s`;
+        timeLine   = `<t:${Math.floor(auction.endsAt / 1000)}:R>`;
       } else {
-        // ended but not yet on cooldown (key gen in progress or failed)
         const top = getTopBid(auction);
-        statusLine = '⏳ **Processing winner...**';
+        statusLine = '⏳ **Finalizing...**';
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids';
         timeLine   = '—';
       }
  
       embed.addFields({
         name:  `${icon} ${proj.name} — Slot ${i}`,
-        value: `Status: ${statusLine}\nTop Bid: ${topBidLine}\nTime Left: ${timeLine}\nReward: **${AUCTION_FIXED_HOURS}h flat**`,
+        value: [
+          `Status: ${statusLine}`,
+          `Top Bid: ${topBidLine}`,
+          `Ends: ${timeLine}`,
+          `Prize: **${AUCTION_FIXED_HOURS}h flat**`,
+        ].join('\n'),
         inline: true
       });
     }
@@ -525,16 +650,32 @@ function generateAuctionSectionEmbed() {
  
 // ===== ACTION ROWS =====
 function buildPanelRow() {
+  const paused = isSystemPaused();
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('select_project_1').setLabel('🔵 Basic').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('select_project_2').setLabel('🟣 Premium').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('buy_crypto').setLabel('💳 Buy Credits').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('view_slots').setLabel('📊 View Slots').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder()
+      .setCustomId('select_project_1')
+      .setLabel('🔵 Basic')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(paused),
+    new ButtonBuilder()
+      .setCustomId('select_project_2')
+      .setLabel('🟣 Premium')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(paused),
+    new ButtonBuilder()
+      .setCustomId('buy_crypto')
+      .setLabel('💳 Buy Credits')
+      .setStyle(ButtonStyle.Success),  // always available
+    new ButtonBuilder()
+      .setCustomId('view_slots')
+      .setLabel('📊 View Slots')
+      .setStyle(ButtonStyle.Secondary)
   );
 }
  
 function buildBidRow() {
-  const rows = [];
+  const rows   = [];
+  const paused = isSystemPaused();
   for (const num of AUCTION_PROJECTS) {
     const proj       = PROJECTS[num];
     const icon       = num === 3 ? '🌾' : '⚔️';
@@ -543,8 +684,7 @@ function buildBidRow() {
       const aId        = getAuctionId(num, i);
       const auction    = auctions[aId];
       const onCooldown = isAuctionSlotOnCooldown(num, i);
-      // Disable if: cooldown active, ended (processing), or no auction object
-      const isDisabled = onCooldown || auction?.status === 'ended';
+      const isDisabled = paused || onCooldown || auction?.status === 'ended';
       components.push(
         new ButtonBuilder()
           .setCustomId(`place_bid_${aId}`)
@@ -592,7 +732,6 @@ function ensureAuction(projectNum, slotIndex) {
  
 const endingAuctions = new Set();
  
-// FIX: helper to refund all bidders except the winner (or all if no winner)
 async function refundBidders(auction, winnerUserId = null) {
   for (const bid of (auction.bids || [])) {
     if (bid.userId === winnerUserId) continue;
@@ -600,14 +739,16 @@ async function refundBidders(auction, winnerUserId = null) {
     users[bid.userId].credits += bid.amount;
     console.log(`↩️  Refunded ${bid.amount} credits to ${bid.userId}`);
     try {
-      const loser = await client.users.fetch(bid.userId);
+      const loser   = await client.users.fetch(bid.userId);
       const project = PROJECTS[auction.projectNum];
       await loser.send({
         embeds: [
           new EmbedBuilder()
-            .setTitle(`❌ You lost the ${project.name} Slot ${auction.slotIndex} auction`)
+            .setTitle(`❌ Auction Lost — ${project.name} Slot ${auction.slotIndex}`)
             .setColor(0xED4245)
-            .setDescription(`Your **${bid.amount} credits** have been refunded.\nBalance: **${users[bid.userId].credits}**`)
+            .setDescription(`You didn't win this round. Your **${bid.amount} credits** have been refunded.`)
+            .addFields({ name: '💳 Balance', value: `**${users[bid.userId].credits} credits**`, inline: true })
+            .setFooter({ text: 'Better luck next time  •  Lion Notifier' })
         ]
       });
     } catch {}
@@ -627,7 +768,6 @@ async function endAuction(auctionId) {
  
   const topBid = getTopBid(auction);
  
-  // Helper: reset this auction slot back to idle after a delay
   const resetToIdle = (delay = 10_000) => {
     setTimeout(() => {
       if (auctions[auctionId]) {
@@ -655,33 +795,28 @@ async function endAuction(auctionId) {
   const project = PROJECTS[auction.projectNum];
   ensureUser(topBid.userId);
  
-  // FIX: Credits were held (escrowed) when bids were placed, so no need to re-check/re-deduct here.
-  // The winner's bid amount was already deducted at bid time; losers are refunded below.
-  // We just need to verify the winner still has at least 0 credits (sanity check).
-  // (If using escrow model, the winner's credits were already locked, so this check is just defensive.)
   if (users[topBid.userId].credits < 0) {
-    console.warn(`⚠️ ${topBid.userId} has negative credits after winning ${auctionId} — this shouldn't happen`);
+    console.warn(`⚠️ ${topBid.userId} has negative credits after winning ${auctionId}`);
   }
  
-  let key, expiry;
+  let key, expiry, luarmorIdentifier;
   try {
     let username = topBid.userId;
     try {
-      const u = await client.users.fetch(topBid.userId);
+      const u  = await client.users.fetch(topBid.userId);
       username = u.username;
     } catch {}
  
-    // FIX: Generate key BEFORE touching any state, so failure is clean
-    const keyResult = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
-    key    = keyResult.key;
-    expiry = keyResult.expiry;
+    const keyResult      = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
+    key                  = keyResult.key;
+    expiry               = keyResult.expiry;
+    luarmorIdentifier    = keyResult.identifier;
   } catch (err) {
     console.error(`❌ Key generation failed for ${auctionId}:`, err.message);
  
-    // FIX: On key gen failure, refund the WINNER their bid too and reset
     ensureUser(topBid.userId);
     users[topBid.userId].credits += topBid.amount;
-    await refundBidders(auction, topBid.userId); // refund all losers
+    await refundBidders(auction, topBid.userId);
     saveUsers();
     saveCreditsBackup();
  
@@ -690,14 +825,18 @@ async function endAuction(auctionId) {
       await winner.send({
         embeds: [
           new EmbedBuilder()
-            .setTitle(`⚠️ Auction Key Generation Failed`)
+            .setTitle('⚠️ Key Generation Failed')
             .setColor(0xED4245)
-            .setDescription(`You won the **${project.name} Slot ${auction.slotIndex}** auction but there was an error generating your key.\nYour **${topBid.amount} credits** have been refunded.\nBalance: **${users[topBid.userId].credits}**\n\nPlease contact an admin.`)
+            .setDescription(
+              `You won **${project.name} Slot ${auction.slotIndex}** but there was an error generating your key.\n` +
+              `Your **${topBid.amount} credits** have been refunded. Please contact an admin.`
+            )
+            .addFields({ name: '💳 Balance', value: `**${users[topBid.userId].credits} credits**`, inline: true })
+            .setFooter({ text: 'Lion Notifier' })
         ]
       });
     } catch {}
  
-    // Notify in panel channel if possible
     try {
       if (panelState.channelId) {
         const channel = await client.channels.fetch(panelState.channelId);
@@ -705,67 +844,60 @@ async function endAuction(auctionId) {
       }
     } catch {}
  
-    saveUsers();
-    saveCreditsBackup();
     return resetToIdle(5_000);
   }
  
-  // Key generated successfully — now set cooldown and update slots
   auction.cooldownUntil = Date.now() + AUCTION_COOLDOWN_MS;
   auction._lastWinner   = topBid.userId;
   saveAuctions();
  
-  // FIX: Remove any existing slot for this user+project before adding new one
   slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
   slots.push({
-    userId:     topBid.userId,
+    userId:            topBid.userId,
     key,
     expiry,
-    project:    project.name,
-    projectNum: auction.projectNum,
-    fromAuction: true,
+    project:           project.name,
+    projectNum:        auction.projectNum,
+    luarmorIdentifier,
+    fromAuction:       true,
     auctionId,
   });
   saveSlots();
  
-  // FIX: Winner's credits were already deducted at bid time (escrow model).
-  // No additional deduction needed here. Save & backup.
   saveUsers();
   saveCreditsBackup();
  
   await updatePanelMessage();
  
-  // FIX: DM winner with key — this was broken before because it was inside a try/catch
-  // that would silently swallow errors and skip the DM entirely
   try {
     const discordUser = await client.users.fetch(topBid.userId);
     await discordUser.send({
       embeds: [
         new EmbedBuilder()
-          .setTitle(`🎉 You won ${project.name} Slot ${auction.slotIndex}!`)
+          .setTitle(`🎉 Auction Won — ${project.name} Slot ${auction.slotIndex}`)
           .setColor(0x57F287)
+          .setDescription(`Congratulations! You placed the winning bid and your key is ready.`)
           .addFields(
-            { name: '🔑 Your Key',         value: `\`${key}\``,                                   inline: false },
-            { name: '⏳ Duration',          value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
-            { name: '📅 Expires',           value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
-            { name: '💳 Credits Spent',     value: `${topBid.amount}`,                             inline: true  },
-            { name: '💳 Credits Remaining', value: `${users[topBid.userId].credits}`,              inline: true  }
+            { name: '🔑 Your Key',          value: `\`${key}\``,                                   inline: false },
+            { name: '⏳ Duration',           value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
+            { name: '📅 Expires',            value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
+            { name: '💳 Credits Spent',      value: `**${topBid.amount}**`,                         inline: true  },
+            { name: '💳 Credits Remaining',  value: `**${users[topBid.userId].credits}**`,          inline: true  }
           )
-          .setFooter({ text: 'Keep your key private. The slot is now marked as occupied.' })
+          .setFooter({ text: 'Keep your key private. The slot is now occupied for 2 hours.  •  Lion Notifier' })
       ]
     });
     console.log(`✅ Key DM sent to winner ${topBid.userId}`);
   } catch (err) {
     console.error(`❌ Could not DM winner ${topBid.userId}:`, err.message);
-    // FIX: If we can't DM the winner, post the key in the panel channel as fallback
     try {
       if (panelState.channelId) {
         const channel = await client.channels.fetch(panelState.channelId);
         await channel.send({
-          content: `⚠️ <@${topBid.userId}> — couldn't DM you your key. Here it is (delete this message after copying):`,
+          content: `⚠️ <@${topBid.userId}> — couldn't DM you. Here's your key (delete after copying):`,
           embeds: [
             new EmbedBuilder()
-              .setTitle(`🎉 Auction Won: ${project.name} Slot ${auction.slotIndex}`)
+              .setTitle(`🎉 Auction Won — ${project.name} Slot ${auction.slotIndex}`)
               .setColor(0x57F287)
               .addFields(
                 { name: '🔑 Key',     value: `\`${key}\``,                         inline: false },
@@ -779,29 +911,31 @@ async function endAuction(auctionId) {
     }
   }
  
-  // Refund all losing bidders
   await refundBidders(auction, topBid.userId);
   saveUsers();
   saveCreditsBackup();
  
   console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits | Key: ${key}`);
  
-  // Announce in panel channel
   try {
     if (panelState.channelId) {
       const channel = await client.channels.fetch(panelState.channelId);
       await channel.send({
         embeds: [
           new EmbedBuilder()
-            .setTitle(`🏆 Auction Ended: ${project.name} Slot ${auction.slotIndex}`)
+            .setTitle(`🏆 Auction Closed — ${project.name} Slot ${auction.slotIndex}`)
             .setColor(0xF5C542)
-            .setDescription(`<@${topBid.userId}> won with a bid of **${topBid.amount} credits** and has received their key via DM!\nSlot is now **occupied** for **${AUCTION_FIXED_HOURS} hours**.`)
+            .setDescription(
+              `<@${topBid.userId}> won with a bid of **${topBid.amount} credits** and has received their key via DM.\n` +
+              `This slot is now **occupied for ${AUCTION_FIXED_HOURS} hours**.`
+            )
+            .setFooter({ text: 'Lion Notifier  •  Bid Auctions' })
+            .setTimestamp()
         ]
       });
     }
   } catch {}
  
-  // Reset to idle after the full 2-hour cooldown
   resetToIdle(AUCTION_COOLDOWN_MS);
 }
  
@@ -834,11 +968,18 @@ client.on('interactionCreate', async interaction => {
           ? `🔒 Cooldown (${formatTime(a.cooldownUntil - Date.now())} left)`
           : !a || a.status === 'idle' ? '⚪ Idle' : a.status === 'live' ? '🔴 Live' : '✅ Ended';
         const topBid = a ? getTopBid(a) : null;
-        lines.push(`${proj.name} Slot ${i}: ${st}${topBid ? ` | Top: ${topBid.amount}cr by <@${topBid.userId}>` : ''}`);
+        lines.push(`**${proj.name} Slot ${i}:** ${st}${topBid ? ` · Top: ${topBid.amount}cr by <@${topBid.userId}>` : ''}`);
       }
     }
     return interaction.reply({
-      embeds: [new EmbedBuilder().setTitle('🏷️ Auction Status').setColor(0xF5C542).setDescription(lines.join('\n') || 'No auctions.')],
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('🏷️ Auction Status — Admin View')
+          .setColor(0xF5C542)
+          .setDescription(lines.join('\n') || 'No auctions.')
+          .setFooter({ text: 'Lion Notifier Admin' })
+          .setTimestamp()
+      ],
       ephemeral: true
     });
   }
@@ -850,14 +991,34 @@ client.on('interactionCreate', async interaction => {
     users[target.id].credits += amount;
     saveUsers();
     saveCreditsBackup();
-    return interaction.reply({ content: `✅ Gave **${amount} credits** to ${target.tag}. Balance: **${users[target.id].credits}**` });
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('✅ Credits Given')
+          .setColor(0x57F287)
+          .addFields(
+            { name: 'User',        value: target.tag,                          inline: true },
+            { name: 'Added',       value: `**+${amount} credits**`,            inline: true },
+            { name: 'New Balance', value: `**${users[target.id].credits}**`,   inline: true }
+          )
+          .setFooter({ text: 'Lion Notifier Admin' })
+      ],
+      ephemeral: true
+    });
   }
  
   if (interaction.commandName === 'backupcredits' && isAdmin) {
     saveCreditsBackup();
     const count = Object.keys(users).length;
     return interaction.reply({
-      content: `✅ Credits backed up for **${count} user(s)** → \`credits_backup.json\`.`,
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('💾 Credits Backed Up')
+          .setColor(0x57F287)
+          .setDescription(`Saved credits for **${count} user(s)** → \`credits_backup.json\``)
+          .setFooter({ text: 'Lion Notifier Admin' })
+          .setTimestamp()
+      ],
       ephemeral: true
     });
   }
@@ -865,7 +1026,16 @@ client.on('interactionCreate', async interaction => {
   if (interaction.commandName === 'restorecredits' && isAdmin) {
     const backup = loadCreditsBackup();
     if (!backup) {
-      return interaction.reply({ content: '❌ No backup file found (`credits_backup.json`). Run `/backupcredits` first.', ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ No Backup Found')
+            .setColor(0xED4245)
+            .setDescription('Run `/backupcredits` first to create a backup file.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ],
+        ephemeral: true
+      });
     }
     let restored = 0;
     for (const [userId, credits] of Object.entries(backup)) {
@@ -875,7 +1045,14 @@ client.on('interactionCreate', async interaction => {
     }
     saveUsers();
     return interaction.reply({
-      content: `✅ Restored credits for **${restored} user(s)** from backup.`,
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('✅ Credits Restored')
+          .setColor(0x57F287)
+          .setDescription(`Restored credits for **${restored} user(s)** from backup.`)
+          .setFooter({ text: 'Lion Notifier Admin' })
+          .setTimestamp()
+      ],
       ephemeral: true
     });
   }
@@ -884,32 +1061,44 @@ client.on('interactionCreate', async interaction => {
     const target = interaction.options.getUser('user');
     ensureUser(target.id);
     return interaction.reply({
-      content: `💳 **${target.tag}** has **${users[target.id].credits} credits**.`,
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('💳 Credit Balance')
+          .setColor(0x5865F2)
+          .addFields(
+            { name: 'User',    value: target.tag,                         inline: true },
+            { name: 'Balance', value: `**${users[target.id].credits} credits**`, inline: true }
+          )
+          .setFooter({ text: 'Lion Notifier Admin' })
+      ],
       ephemeral: true
     });
   }
  
-  // FIX: force-end a stuck auction
   if (interaction.commandName === 'forceendauction' && isAdmin) {
     const auctionId = interaction.options.getString('auction_id');
     if (!auctions[auctionId]) {
-      return interaction.reply({ content: `❌ No auction found with ID \`${auctionId}\`.`, ephemeral: true });
+      return interaction.reply({
+        embeds: [new EmbedBuilder().setTitle('❌ Not Found').setColor(0xED4245).setDescription(`No auction with ID \`${auctionId}\`.`)],
+        ephemeral: true
+      });
     }
     await interaction.reply({ content: `⚙️ Force-ending \`${auctionId}\`...`, ephemeral: true });
-    auctions[auctionId].status = 'live'; // ensure endAuction won't skip it
-    endingAuctions.delete(auctionId);    // clear lock so it can re-run
+    auctions[auctionId].status = 'live';
+    endingAuctions.delete(auctionId);
     await endAuction(auctionId);
     return;
   }
  
-  // FIX: reset a stuck auction to idle (with refunds)
   if (interaction.commandName === 'resetauction' && isAdmin) {
     const auctionId = interaction.options.getString('auction_id');
     if (!auctions[auctionId]) {
-      return interaction.reply({ content: `❌ No auction found with ID \`${auctionId}\`.`, ephemeral: true });
+      return interaction.reply({
+        embeds: [new EmbedBuilder().setTitle('❌ Not Found').setColor(0xED4245).setDescription(`No auction with ID \`${auctionId}\`.`)],
+        ephemeral: true
+      });
     }
     const auction = auctions[auctionId];
-    // Refund all current bidders
     await refundBidders(auction, null);
     saveUsers();
     saveCreditsBackup();
@@ -925,7 +1114,86 @@ client.on('interactionCreate', async interaction => {
     saveAuctions();
     endingAuctions.delete(auctionId);
     await updatePanelMessage();
-    return interaction.reply({ content: `✅ Auction \`${auctionId}\` reset to idle. All bidders refunded.`, ephemeral: true });
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('✅ Auction Reset')
+          .setColor(0x57F287)
+          .setDescription(`Auction \`${auctionId}\` has been reset to idle. All bidders refunded.`)
+          .setFooter({ text: 'Lion Notifier Admin' })
+      ],
+      ephemeral: true
+    });
+  }
+
+  // ===== PAUSE =====
+  if (interaction.commandName === 'pause' && isAdmin) {
+    if (isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏸️ Already Paused')
+            .setColor(0xFEE75C)
+            .setDescription(`The system is already paused.\nPaused since: <t:${Math.floor(pauseState.pausedAt / 1000)}:R>\n\nUse \`/unpause\` to resume and grant players back their lost time.`)
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ],
+        ephemeral: true
+      });
+    }
+    await pauseSystem();
+    await updatePanelMessage();
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('⏸️ System Paused')
+          .setColor(0xED4245)
+          .setDescription(
+            'The slot system is now **paused**.\n\n' +
+            '• New slot purchases are **disabled**\n' +
+            '• Auction bidding is **disabled**\n' +
+            '• Slot countdowns are **frozen**\n' +
+            '• Crypto payments **continue** processing\n\n' +
+            'When you `/unpause`, all active keys will be **automatically extended** by the paused duration via the Luarmor API.'
+          )
+          .setFooter({ text: 'Lion Notifier Admin' })
+          .setTimestamp()
+      ],
+      ephemeral: false   // visible so users know
+    });
+  }
+
+  // ===== UNPAUSE =====
+  if (interaction.commandName === 'unpause' && isAdmin) {
+    if (!isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('▶️ Already Running')
+            .setColor(0xFEE75C)
+            .setDescription('The system is not currently paused.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ],
+        ephemeral: true
+      });
+    }
+    await interaction.deferReply({ ephemeral: false });
+    const result = await unpauseSystem();
+    await updatePanelMessage();
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('▶️ System Unpaused')
+          .setColor(0x57F287)
+          .setDescription(
+            'The slot system is now **live** again.\n\n' +
+            `• Paused for: **${formatTime(result.pausedDuration)}**\n` +
+            `• Active keys extended: **${result.extended}**\n\n` +
+            'All active Luarmor keys have been extended by the paused duration.'
+          )
+          .setFooter({ text: 'Lion Notifier Admin' })
+          .setTimestamp()
+      ]
+    });
   }
 });
  
@@ -936,6 +1204,7 @@ client.on('interactionCreate', async interaction => {
   ensureUser(userId);
  
   if (interaction.customId === 'buy_crypto') {
+    // Crypto purchasing is ALWAYS available (even during pause)
     const modal = new ModalBuilder()
       .setCustomId('buy_credits_modal')
       .setTitle('Buy Credits with Crypto');
@@ -943,7 +1212,7 @@ client.on('interactionCreate', async interaction => {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('usd_amount')
-          .setLabel(`Credits to buy — Balance: ${users[userId].credits} ($1 = 1 credit)`)
+          .setLabel(`Credits to buy (you have ${users[userId].credits}) — $1 = 1 credit`)
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('e.g. 10')
           .setRequired(true)
@@ -965,17 +1234,52 @@ client.on('interactionCreate', async interaction => {
   }
  
   if (['select_project_1', 'select_project_2'].includes(interaction.customId)) {
+    if (isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏸️ System Paused')
+            .setColor(0xED4245)
+            .setDescription('Slot purchases are currently unavailable while the system is paused.\nCheck back soon!')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+
     const num         = interaction.customId === 'select_project_1' ? 1 : 2;
     const project     = PROJECTS[num];
     const userCredits = users[userId].credits;
  
-    if (userCredits <= 0) {
-      return interaction.reply({ content: `❌ You have **0 credits**. Buy some first using **💳 Buy Credits**.`, ephemeral: true });
+    if (userCredits < project.minCredits) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Not Enough Credits')
+            .setColor(0xED4245)
+            .setDescription(
+              `You need at least **${project.minCredits} credit${project.minCredits !== 1 ? 's' : ''}** to activate a **${project.name}** slot.\n` +
+              `You currently have **${userCredits} credits**.\n\nUse **💳 Buy Credits** to top up.`
+            )
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
     if (getActiveSlots(num) >= project.maxSlots) {
-      return interaction.reply({ content: `❌ All **${project.name}** slots are full right now!`, ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ No Slots Available')
+            .setColor(0xED4245)
+            .setDescription(`All **${project.name}** slots are currently full. Try again later!`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
  
+    const hoursPerCredit = 1 / project.creditsPerHour;
     const modal = new ModalBuilder()
       .setCustomId(`activate_modal_${num}`)
       .setTitle(`Activate ${project.name} Slot`);
@@ -983,9 +1287,13 @@ client.on('interactionCreate', async interaction => {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('credits_amount')
-          .setLabel(`Credits (you have ${userCredits}) — 1c = ${project.creditToHours}h`)
+          .setLabel(`Credits to spend (min ${project.minCredits}, have ${userCredits})`)
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder(`e.g. 5 = ${5 * project.creditToHours} hours`)
+          .setPlaceholder(
+            num === 1
+              ? `e.g. 3 = 3h, 5 = 5h, 10 = 10h`
+              : `e.g. 1 = 20min, 3 = 1h, 9 = 3h`
+          )
           .setRequired(true)
       )
     );
@@ -993,39 +1301,69 @@ client.on('interactionCreate', async interaction => {
   }
  
   if (interaction.customId.startsWith('place_bid_')) {
+    if (isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏸️ System Paused')
+            .setColor(0xED4245)
+            .setDescription('Auction bidding is unavailable while the system is paused. Check back soon!')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+
     const auctionId = interaction.customId.replace('place_bid_', '');
     const parts     = auctionId.split('_');
     const projNum   = parseInt(parts[1]);
     const slotIdx   = parseInt(parts[2]);
     ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
+    const minBid    = AUCTION_MIN_BID[projNum] || 1;
  
     if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
       const timeLeft = formatTime(auction.cooldownUntil - Date.now());
-      return interaction.reply({ content: `🔒 This slot is occupied. Bidding opens again in **${timeLeft}**.`, ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('🔒 Slot Occupied')
+            .setColor(0xED4245)
+            .setDescription(`This slot is currently occupied. Bidding reopens in **${timeLeft}**.`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
  
     if (auction.status === 'ended') {
-      return interaction.reply({ content: '❌ This auction just ended. Wait for the next one.', ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏳ Auction Finalizing')
+            .setColor(0xFEE75C)
+            .setDescription('This auction just ended and is being finalized. Wait for the next round.')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
  
     const topBid      = getTopBid(auction);
-    // FIX: existing bid from this user — min bid only needs to beat the current top (not their own bid)
     const existingBid = auction.bids.find(b => b.userId === userId);
-    const minBid      = topBid
-      ? (topBid.userId === userId ? topBid.amount + 1 : topBid.amount + 1)
-      : 1;
+    const currentTop  = topBid ? topBid.amount : 0;
+    const calcMin     = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
  
     const modal = new ModalBuilder()
       .setCustomId(`bid_modal_${auctionId}`)
-      .setTitle(`Bid for ${AUCTION_FIXED_HOURS}h — ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}`);
+      .setTitle(`Bid — ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('bid_amount')
-          .setLabel(`Min bid: ${minBid} credits | You have: ${users[userId].credits}${existingBid ? ` | Your bid: ${existingBid.amount}` : ''}`)
+          .setLabel(`Min: ${calcMin} cr | Balance: ${users[userId].credits}${existingBid ? ` | Your bid: ${existingBid.amount}` : ''}`)
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder(`e.g. ${minBid}`)
+          .setPlaceholder(`e.g. ${calcMin}`)
           .setRequired(true)
       )
     );
@@ -1047,10 +1385,26 @@ client.on('interactionCreate', async interaction => {
     const usdAmount = parseInt(rawUsd);
  
     if (isNaN(usdAmount) || usdAmount < 1) {
-      return interaction.editReply({ content: '❌ Enter a valid dollar amount (minimum $1).' });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Invalid Amount')
+            .setColor(0xED4245)
+            .setDescription('Please enter a valid dollar amount (minimum **$1**).')
+            .setFooter({ text: 'Lion Notifier' })
+        ]
+      });
     }
     if (!['btc', 'ltc'].includes(rawCoin)) {
-      return interaction.editReply({ content: '❌ Invalid coin. Type **btc** or **ltc**.' });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Invalid Coin')
+            .setColor(0xED4245)
+            .setDescription('Supported coins: **btc** or **ltc**')
+            .setFooter({ text: 'Lion Notifier' })
+        ]
+      });
     }
  
     try {
@@ -1059,7 +1413,15 @@ client.on('interactionCreate', async interaction => {
  
       if (!payment_id || !pay_address) {
         console.error('NowPayments incomplete response:', JSON.stringify(paymentData));
-        return interaction.editReply({ content: '❌ NowPayments returned an incomplete response. Try again in a moment.' });
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle('❌ Invoice Error')
+              .setColor(0xED4245)
+              .setDescription('NowPayments returned an incomplete response. Please try again in a moment.')
+              .setFooter({ text: 'Lion Notifier' })
+          ]
+        });
       }
  
       payments[payment_id] = {
@@ -1084,25 +1446,25 @@ client.on('interactionCreate', async interaction => {
  
       const coinLabel = (pay_currency || rawCoin).toUpperCase();
       const embed = new EmbedBuilder()
-        .setTitle(`💳 Pay with ${coinLabel} — ${usdAmount} Credits`)
+        .setTitle(`💳 ${coinLabel} Invoice — ${usdAmount} Credits`)
         .setColor(0xF5C542)
         .setDescription(
-          'Send **exactly** the amount shown below to the address provided.\n' +
-          'Credits are added **automatically** once your payment confirms.\n\n' +
-          '⚠️ This invoice is **unique to you** — do not share or reuse it.\n' +
-          '⚠️ Send **only** the specified coin to this address.'
+          '> Send **exactly** the amount shown to the address below.\n' +
+          '> Credits are added **automatically** once your payment confirms.\n\n' +
+          '⚠️ This invoice is **unique** — do not share or reuse it.\n' +
+          '⚠️ Only send the **exact coin** to this address.'
         )
         .addFields(
-          { name: `${coinLabel} Address`,     value: `\`${pay_address}\``,               inline: false },
-          { name: 'Amount to Send',           value: `**${pay_amount} ${coinLabel}**`,   inline: true  },
-          { name: "Credits You'll Receive",   value: `**${usdAmount}**`,                 inline: true  },
-          { name: 'Payment ID',               value: `\`${payment_id}\``,                inline: false },
+          { name: `📬 ${coinLabel} Address`,    value: `\`\`\`${pay_address}\`\`\``,          inline: false },
+          { name: '💸 Amount to Send',          value: `**${pay_amount} ${coinLabel}**`,       inline: true  },
+          { name: "🎁 Credits You'll Receive",  value: `**${usdAmount} credits**`,             inline: true  },
+          { name: '🆔 Payment ID',              value: `\`${payment_id}\``,                    inline: false },
         )
-        .setFooter({ text: 'Invoice expires in ~20 min. Create a new one if it expires.' });
+        .setFooter({ text: 'Invoice expires in ~20 min — create a new one if it expires  •  Lion Notifier' });
  
       if (expiration_estimate_date) {
         const expireTs = Math.floor(new Date(expiration_estimate_date).getTime() / 1000);
-        embed.addFields({ name: 'Expires', value: `<t:${expireTs}:R>`, inline: true });
+        embed.addFields({ name: '⏰ Expires', value: `<t:${expireTs}:R>`, inline: true });
       }
  
       if (qrAttach) embed.setImage(`attachment://${qrFile}`);
@@ -1112,111 +1474,225 @@ client.on('interactionCreate', async interaction => {
     } catch (err) {
       const msg = err.response?.data?.message || err.message;
       console.error('createNowPayment error:', err.response?.data || err.message);
-      return interaction.editReply({ content: `❌ Failed to create payment invoice: ${msg}` });
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Payment Error')
+            .setColor(0xED4245)
+            .setDescription(`Failed to create payment invoice:\n\`\`\`${msg}\`\`\``)
+            .setFooter({ text: 'Lion Notifier' })
+        ]
+      });
     }
   }
  
   if (interaction.customId.startsWith('activate_modal_')) {
+    if (isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏸️ System Paused')
+            .setColor(0xED4245)
+            .setDescription('Slot purchases are unavailable while the system is paused.')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+
     const num            = parseInt(interaction.customId.split('_')[2]);
     const project        = PROJECTS[num];
     const creditsToSpend = parseInt(interaction.fields.getTextInputValue('credits_amount'));
     const userCredits    = users[userId].credits;
  
     if (!creditsToSpend || isNaN(creditsToSpend) || creditsToSpend <= 0) {
-      return interaction.reply({ content: '❌ Enter a valid number of credits.', ephemeral: true });
+      return interaction.reply({
+        embeds: [new EmbedBuilder().setTitle('❌ Invalid Amount').setColor(0xED4245).setDescription('Enter a valid number of credits.')],
+        ephemeral: true
+      });
+    }
+    if (creditsToSpend < project.minCredits) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Below Minimum')
+            .setColor(0xED4245)
+            .setDescription(
+              `The minimum for **${project.name}** is **${project.minCredits} credit${project.minCredits !== 1 ? 's' : ''}**.\n` +
+              `You entered **${creditsToSpend}**.`
+            )
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
     if (creditsToSpend > userCredits) {
-      return interaction.reply({ content: `❌ You only have **${userCredits} credits**.`, ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Insufficient Credits')
+            .setColor(0xED4245)
+            .setDescription(`You only have **${userCredits} credits** but tried to spend **${creditsToSpend}**.`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
     if (getActiveSlots(num) >= project.maxSlots) {
-      return interaction.reply({ content: `❌ All **${project.name}** slots are full!`, ephemeral: true });
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ No Slots Available')
+            .setColor(0xED4245)
+            .setDescription(`All **${project.name}** slots are currently full.`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
     }
  
     try {
-      const username        = interaction.user.username;
-      const hours           = creditsToSpend * project.creditToHours;
-      const { key, expiry } = await createLuarmorKey(hours, userId, username, project);
+      const username          = interaction.user.username;
+      const hours             = creditsToHours(num, creditsToSpend);
+      const { key, expiry, identifier } = await createLuarmorKey(hours, userId, username, project);
  
-      // FIX: deduct AFTER key is successfully generated
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
-      slots.push({ userId, key, expiry, project: project.name, projectNum: num });
+      slots.push({ userId, key, expiry, project: project.name, projectNum: num, luarmorIdentifier: identifier });
       users[userId].credits -= creditsToSpend;
       saveUsers();
       saveSlots();
       saveCreditsBackup();
       updatePanelMessage();
+
+      const hoursDisplay = hours % 1 === 0 ? `${hours}h` : `${Math.floor(hours)}h ${Math.round((hours % 1) * 60)}m`;
  
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
-            .setTitle(`✅ ${project.name} Slot Activated!`)
+            .setTitle(`✅ ${project.name} Slot Activated`)
             .setColor(0x57F287)
+            .setDescription(`Your slot is live and your key is ready to use!`)
             .addFields(
-              { name: '🔑 Your Key',         value: `\`${key}\``,                         inline: false },
-              { name: '⏳ Duration',          value: `${hours} hours`,                     inline: true  },
-              { name: '📅 Expires',           value: `<t:${Math.floor(expiry / 1000)}:R>`, inline: true  },
-              { name: '💳 Credits Remaining', value: `${users[userId].credits}`,           inline: true  }
+              { name: '🔑 Your Key',          value: `\`${key}\``,                         inline: false },
+              { name: '⏳ Duration',           value: hoursDisplay,                          inline: true  },
+              { name: '📅 Expires',            value: `<t:${Math.floor(expiry / 1000)}:R>`, inline: true  },
+              { name: '💳 Credits Spent',      value: `**${creditsToSpend}**`,              inline: true  },
+              { name: '💳 Credits Remaining',  value: `**${users[userId].credits}**`,       inline: true  }
             )
-            .setFooter({ text: 'Keep your key private.' })
+            .setFooter({ text: 'Keep your key private  •  Lion Notifier' })
         ],
         ephemeral: true
       });
     } catch (err) {
       return interaction.reply({
-        content: `❌ Luarmor Error:\n\`\`\`${err.message.slice(0, 1800)}\`\`\``,
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Luarmor Error')
+            .setColor(0xED4245)
+            .setDescription(`\`\`\`${err.message.slice(0, 1800)}\`\`\``)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
         ephemeral: true
       });
     }
   }
  
   if (interaction.customId.startsWith('bid_modal_')) {
+    if (isSystemPaused()) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏸️ System Paused')
+            .setColor(0xED4245)
+            .setDescription('Auction bidding is unavailable while the system is paused.')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+
     const auctionId = interaction.customId.replace('bid_modal_', '');
     const parts     = auctionId.split('_');
     const projNum   = parseInt(parts[1]);
     const slotIdx   = parseInt(parts[2]);
     ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
+    const minBid    = AUCTION_MIN_BID[projNum] || 1;
  
     if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
-      return interaction.reply({ content: '🔒 This slot is occupied by the winner. Bidding is locked until the key expires.', ephemeral: true });
-    }
- 
-    if (auction.status === 'ended') {
-      return interaction.reply({ content: '❌ This auction just ended.', ephemeral: true });
-    }
- 
-    const bidAmount = parseInt(interaction.fields.getTextInputValue('bid_amount'));
-    if (isNaN(bidAmount) || bidAmount <= 0) {
-      return interaction.reply({ content: '❌ Enter a valid bid amount.', ephemeral: true });
-    }
- 
-    const topBid = getTopBid(auction);
-    const minBid = topBid ? topBid.amount + 1 : 1;
- 
-    if (bidAmount < minBid) {
-      return interaction.reply({ content: `❌ Minimum bid is **${minBid} credits**.`, ephemeral: true });
-    }
- 
-    // FIX: Re-validate credits at modal submit time (prevents race where user spends credits between opening modal and submitting)
-    ensureUser(userId); // re-read fresh
-    const existingBid    = auction.bids.find(b => b.userId === userId);
-    const existingAmount = existingBid ? existingBid.amount : 0;
-    // The new bid replaces the old one — user only needs enough to cover the DIFFERENCE (since old credits were already held)
-    // With escrow model: user's total credits already have existingBid deducted, so they need (bidAmount - existingAmount) more
-    const additionalCost = bidAmount - existingAmount;
- 
-    if (additionalCost > users[userId].credits) {
       return interaction.reply({
-        content: `❌ You need **${additionalCost} more credits** for this bid (have **${users[userId].credits}**, upgrading from **${existingAmount}** to **${bidAmount}**).`,
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('🔒 Slot Occupied')
+            .setColor(0xED4245)
+            .setDescription('This slot is currently occupied by the winner. Bidding reopens when the key expires.')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
         ephemeral: true
       });
     }
  
-    // FIX: ESCROW — hold/update credits at bid time so the winner's funds are locked
+    if (auction.status === 'ended') {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('⏳ Auction Finalizing')
+            .setColor(0xFEE75C)
+            .setDescription('This auction just ended. Wait for the next round.')
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+ 
+    const bidAmount = parseInt(interaction.fields.getTextInputValue('bid_amount'));
+    if (isNaN(bidAmount) || bidAmount <= 0) {
+      return interaction.reply({
+        embeds: [new EmbedBuilder().setTitle('❌ Invalid Bid').setColor(0xED4245).setDescription('Enter a valid bid amount.')],
+        ephemeral: true
+      });
+    }
+ 
+    const topBid = getTopBid(auction);
+    const calcMin = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
+ 
+    if (bidAmount < calcMin) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Bid Too Low')
+            .setColor(0xED4245)
+            .setDescription(`Minimum bid is **${calcMin} credits** (floor: ${minBid}, current top: ${topBid ? topBid.amount : 'none'}).`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+ 
+    ensureUser(userId);
+    const existingBid    = auction.bids.find(b => b.userId === userId);
+    const existingAmount = existingBid ? existingBid.amount : 0;
+    const additionalCost = bidAmount - existingAmount;
+ 
+    if (additionalCost > users[userId].credits) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Insufficient Credits')
+            .setColor(0xED4245)
+            .setDescription(
+              `You need **${additionalCost} more credits** for this bid.\n` +
+              `Current balance: **${users[userId].credits}** | Upgrading: **${existingAmount} → ${bidAmount}**`
+            )
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+ 
     if (existingBid) {
-      // Refund the difference of the old bid, then charge the new full amount
-      users[userId].credits -= additionalCost; // net: charge only the increase
-      existingBid.amount = bidAmount;          // update in place
+      users[userId].credits -= additionalCost;
+      existingBid.amount = bidAmount;
     } else {
       users[userId].credits -= bidAmount;
       auction.bids.push({ userId, amount: bidAmount });
@@ -1235,7 +1711,6 @@ client.on('interactionCreate', async interaction => {
     const timeLeft = auction.endsAt ? (auction.endsAt - Date.now()) : 0;
     if (!isFirstBid && timeLeft < 60_000) {
       auction.endsAt = Date.now() + 60_000;
-      // FIX: clear old timer and set a new one (track with a flag to avoid double-ending)
       endingAuctions.delete(auctionId);
       setTimeout(() => endAuction(auctionId), 60_000);
     }
@@ -1243,8 +1718,21 @@ client.on('interactionCreate', async interaction => {
     saveAuctions();
     await updatePanelMessage();
  
+    const proj = PROJECTS[auction.projectNum];
     return interaction.reply({
-      content: `✅ Bid of **${bidAmount} credits** placed on ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}!\n💳 Credits on hold: **${bidAmount}** | Balance: **${users[userId].credits}**\nIf you win, you'll receive **${AUCTION_FIXED_HOURS} hours** flat.${isFirstBid ? '\n⏰ **Auction started! 5 minutes on the clock.**' : ''}`,
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`✅ Bid Placed — ${proj.name} Slot ${auction.slotIndex}`)
+          .setColor(0x57F287)
+          .setDescription(isFirstBid ? '⏰ **Auction started! 5 minutes on the clock.**' : 'Your bid has been updated.')
+          .addFields(
+            { name: '💸 Your Bid',     value: `**${bidAmount} credits**`,         inline: true },
+            { name: '🔒 On Hold',      value: `**${bidAmount} credits**`,         inline: true },
+            { name: '💳 Balance',      value: `**${users[userId].credits}**`,     inline: true },
+            { name: '🏆 Prize',        value: `**${AUCTION_FIXED_HOURS}h flat**`, inline: true },
+          )
+          .setFooter({ text: 'If outbid, your credits are refunded instantly  •  Lion Notifier' })
+      ],
       ephemeral: true
     });
   }
@@ -1253,6 +1741,7 @@ client.on('interactionCreate', async interaction => {
 // ===== INTERVALS =====
  
 setInterval(() => {
+  if (isSystemPaused()) return; // don't clean slots while paused
   const before = slots.length;
   slots = slots.filter(s => s && s.expiry > Date.now());
   if (slots.length !== before) { saveSlots(); console.log(`🧹 Cleaned ${before - slots.length} expired slot(s)`); }
@@ -1294,7 +1783,6 @@ client.once('ready', async () => {
   // Resume cooldown timers
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) {
-      // If cooldown has already expired, reset to idle immediately
       if (auction.cooldownUntil && auction.cooldownUntil <= Date.now() && auction.status !== 'idle') {
         auctions[auctionId] = {
           projectNum:    auction.projectNum,
