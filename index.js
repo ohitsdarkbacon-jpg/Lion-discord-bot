@@ -40,21 +40,17 @@ let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PA
 let pauseState = fs.existsSync(PAUSE_STATE_FILE) ? JSON.parse(fs.readFileSync(PAUSE_STATE_FILE)) : { paused: false, pausedAt: null };
  
 // ===== PROJECT CONFIG =====
-// Basic:   1 credit = 1 hour, minimum 3 credits (3 hours)
-// Premium: 3 credits = 1 hour (i.e. 1 credit = 1/3 hour), minimum 1 credit (1/3 hour → so min spend = 1 credit = 20min, but requirement says "minimum 1 hour" → min credits = 3)
-// Per requirement: Basic = 1cr/hr (min 3 credits), Premium = 3cr/hr (min 1 credit)
+// Basic:   1 credit  = 1 hour,  minimum 3 credits  (= 3 hours)
+// Premium: 3 credits = 1 hour,  minimum 3 credits  (= 1 hour), must be purchased in multiples of 3 (whole hours only)
 const PROJECTS = {
-  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 1, minCredits: 3, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
-  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 3, minCredits: 1, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
-  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
-  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 1, minCredits: 3, creditStep: 1, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
+  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 3, minCredits: 3, creditStep: 3, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
+  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
 };
 
-// Basic: credits × 1 = hours
-// Premium: credits ÷ 3 = hours
 function creditsToHours(projectNum, credits) {
-  const proj = PROJECTS[projectNum];
-  return credits / proj.creditsPerHour;
+  return credits / PROJECTS[projectNum].creditsPerHour;
 }
  
 const AUCTION_PROJECTS      = [3, 4];
@@ -66,7 +62,7 @@ const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000;
 // Minimum bids per auction project
 const AUCTION_MIN_BID = {
   3: 2,  // Farmer: minimum 2 credits
-  4: 6,  // Main: minimum 6 credits
+  4: 6,  // Main:   minimum 6 credits
 };
  
 const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
@@ -130,6 +126,16 @@ const commands = [
   new SlashCommandBuilder()
     .setName('unpause')
     .setDescription('(Admin) Unpause the slot system — adds paused time to all active Luarmor keys'),
+  // EXPORT / IMPORT
+  new SlashCommandBuilder()
+    .setName('exportcredits')
+    .setDescription('(Admin) Export all user credit balances as a downloadable JSON file'),
+  new SlashCommandBuilder()
+    .setName('importcredits')
+    .setDescription('(Admin) Import credit balances from an exported JSON file')
+    .addAttachmentOption(opt =>
+      opt.setName('file').setDescription('The exported credits JSON file').setRequired(true)
+    ),
 ].map(c => c.toJSON());
  
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -180,11 +186,9 @@ async function unpauseSystem() {
     if (slot && slot.expiry > pausedAt) {
       slot.expiry += pausedDuration;
       extended++;
-      // Also extend the Luarmor key via API
       try {
-        const project  = PROJECTS[slot.projectNum];
-        const newExpiry = Math.floor(slot.expiry / 1000);
-        // Luarmor API: update the user's auth_expire
+        const project    = PROJECTS[slot.projectNum];
+        const newExpiry  = Math.floor(slot.expiry / 1000);
         const identifier = slot.luarmorIdentifier || null;
         if (project && slot.userId && identifier) {
           await axios.patch(
@@ -542,7 +546,7 @@ function generatePanelEmbed() {
         name: '🟣 Premium Plan',
         value: [
           `> 💰 **3 credits = 1 hour**`,
-          `> ⏱️  Minimum purchase: **1 credit**`,
+          `> ⏱️  Minimum purchase: **3 credits (1h)** — whole hours only`,
           `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
           `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
         ].join('\n'),
@@ -1066,8 +1070,8 @@ client.on('interactionCreate', async interaction => {
           .setTitle('💳 Credit Balance')
           .setColor(0x5865F2)
           .addFields(
-            { name: 'User',    value: target.tag,                         inline: true },
-            { name: 'Balance', value: `**${users[target.id].credits} credits**`, inline: true }
+            { name: 'User',    value: target.tag,                                    inline: true },
+            { name: 'Balance', value: `**${users[target.id].credits} credits**`,     inline: true }
           )
           .setFooter({ text: 'Lion Notifier Admin' })
       ],
@@ -1158,7 +1162,7 @@ client.on('interactionCreate', async interaction => {
           .setFooter({ text: 'Lion Notifier Admin' })
           .setTimestamp()
       ],
-      ephemeral: false   // visible so users know
+      ephemeral: false
     });
   }
 
@@ -1195,6 +1199,149 @@ client.on('interactionCreate', async interaction => {
       ]
     });
   }
+
+  // ===== EXPORT CREDITS =====
+  // Generates a clean JSON file: { "userId": credits, ... } and sends it as an attachment.
+  if (interaction.commandName === 'exportcredits' && isAdmin) {
+    await interaction.deferReply({ ephemeral: true });
+
+    // Build the export object — userId → credits only (clean, importable format)
+    const exportData = {};
+    for (const [userId, data] of Object.entries(users)) {
+      exportData[userId] = data.credits || 0;
+    }
+
+    const userCount  = Object.keys(exportData).length;
+    const totalCreds = Object.values(exportData).reduce((a, b) => a + b, 0);
+    const timestamp  = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const fileName   = `lion_credits_export_${timestamp}.json`;
+    const fileBuffer = Buffer.from(JSON.stringify(exportData, null, 2), 'utf8');
+    const attachment = new AttachmentBuilder(fileBuffer, { name: fileName });
+
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('📤 Credits Exported')
+          .setColor(0x5865F2)
+          .setDescription(
+            `All user credit balances have been exported to **\`${fileName}\`**.\n\n` +
+            `Use \`/importcredits\` and attach this file to restore or migrate balances.`
+          )
+          .addFields(
+            { name: '👥 Users',         value: `**${userCount}**`,   inline: true },
+            { name: '🪙 Total Credits', value: `**${totalCreds}**`,  inline: true },
+            { name: '📅 Exported At',   value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false },
+          )
+          .setFooter({ text: 'Lion Notifier Admin  •  Keep this file safe' })
+          .setTimestamp()
+      ],
+      files: [attachment]
+    });
+  }
+
+  // ===== IMPORT CREDITS =====
+  // Accepts the exported JSON file, validates it, and sets each user's credits accordingly.
+  if (interaction.commandName === 'importcredits' && isAdmin) {
+    await interaction.deferReply({ ephemeral: true });
+
+    const attachment = interaction.options.getAttachment('file');
+
+    // Basic validation — must be a JSON file
+    if (!attachment.name.endsWith('.json')) {
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Invalid File')
+            .setColor(0xED4245)
+            .setDescription('Please attach a `.json` file exported by `/exportcredits`.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ]
+      });
+    }
+
+    // Fetch the file content from Discord's CDN
+    let rawText;
+    try {
+      const resp = await axios.get(attachment.url, { responseType: 'text' });
+      rawText = resp.data;
+    } catch (err) {
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Download Failed')
+            .setColor(0xED4245)
+            .setDescription(`Could not download the attachment: \`${err.message}\``)
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ]
+      });
+    }
+
+    // Parse JSON
+    let importData;
+    try {
+      importData = typeof rawText === 'string' ? JSON.parse(rawText) : rawText;
+    } catch {
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Invalid JSON')
+            .setColor(0xED4245)
+            .setDescription('The file could not be parsed as JSON. Make sure you\'re using a file exported by `/exportcredits`.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ]
+      });
+    }
+
+    // Validate structure — must be a flat object of { userId: number }
+    if (typeof importData !== 'object' || Array.isArray(importData)) {
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Invalid Format')
+            .setColor(0xED4245)
+            .setDescription('The file format is invalid. Expected `{ "userId": credits }` — use a file from `/exportcredits`.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ]
+      });
+    }
+
+    let imported = 0;
+    let skipped  = 0;
+
+    for (const [userId, credits] of Object.entries(importData)) {
+      // Skip entries with non-numeric or negative credits
+      if (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0) {
+        skipped++;
+        continue;
+      }
+      ensureUser(userId);
+      users[userId].credits = Math.floor(credits); // floor just in case of floats
+      imported++;
+    }
+
+    saveUsers();
+    saveCreditsBackup();
+
+    console.log(`📥 Credits imported: ${imported} users updated, ${skipped} skipped`);
+
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('📥 Credits Imported')
+          .setColor(0x57F287)
+          .setDescription(
+            `Credit balances have been applied from **\`${attachment.name}\`**.\n\n` +
+            `All imported users now have exactly the credits specified in the file.`
+          )
+          .addFields(
+            { name: '✅ Imported', value: `**${imported} user(s)**`, inline: true },
+            { name: '⏭️ Skipped',  value: `**${skipped} entry(s)**`, inline: true },
+          )
+          .setFooter({ text: 'Lion Notifier Admin  •  Credits have been saved and backed up' })
+          .setTimestamp()
+      ]
+    });
+  }
 });
  
 // ===== BUTTON HANDLER =====
@@ -1204,7 +1351,6 @@ client.on('interactionCreate', async interaction => {
   ensureUser(userId);
  
   if (interaction.customId === 'buy_crypto') {
-    // Crypto purchasing is ALWAYS available (even during pause)
     const modal = new ModalBuilder()
       .setCustomId('buy_credits_modal')
       .setTitle('Buy Credits with Crypto');
@@ -1279,7 +1425,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
  
-    const hoursPerCredit = 1 / project.creditsPerHour;
     const modal = new ModalBuilder()
       .setCustomId(`activate_modal_${num}`)
       .setTitle(`Activate ${project.name} Slot`);
@@ -1287,12 +1432,16 @@ client.on('interactionCreate', async interaction => {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('credits_amount')
-          .setLabel(`Credits to spend (min ${project.minCredits}, have ${userCredits})`)
+          .setLabel(
+            num === 2
+              ? `Hours to buy (min 1h = 3cr, have ${userCredits}cr)`
+              : `Credits to spend (min ${project.minCredits}, have ${userCredits})`
+          )
           .setStyle(TextInputStyle.Short)
           .setPlaceholder(
             num === 1
               ? `e.g. 3 = 3h, 5 = 5h, 10 = 10h`
-              : `e.g. 1 = 20min, 3 = 1h, 9 = 3h`
+              : `e.g. 1 = 3cr, 2 = 6cr, 3 = 9cr (whole hours)`
           )
           .setRequired(true)
       )
@@ -1351,7 +1500,6 @@ client.on('interactionCreate', async interaction => {
  
     const topBid      = getTopBid(auction);
     const existingBid = auction.bids.find(b => b.userId === userId);
-    const currentTop  = topBid ? topBid.amount : 0;
     const calcMin     = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
  
     const modal = new ModalBuilder()
@@ -1500,18 +1648,46 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    const num            = parseInt(interaction.customId.split('_')[2]);
-    const project        = PROJECTS[num];
-    const creditsToSpend = parseInt(interaction.fields.getTextInputValue('credits_amount'));
-    const userCredits    = users[userId].credits;
+    const num     = parseInt(interaction.customId.split('_')[2]);
+    const project = PROJECTS[num];
+    const rawInput = parseInt(interaction.fields.getTextInputValue('credits_amount'));
+    const userCredits = users[userId].credits;
+
+    // For Premium (project 2) the user enters HOURS; convert to credits.
+    // For all others, the user enters CREDITS directly.
+    let creditsToSpend;
+    let hoursEntered = null;
+    if (num === 2) {
+      // Premium: input = hours, credits = hours × 3
+      hoursEntered   = rawInput;
+      creditsToSpend = hoursEntered * project.creditsPerHour; // hours × 3
+    } else {
+      creditsToSpend = rawInput;
+    }
  
-    if (!creditsToSpend || isNaN(creditsToSpend) || creditsToSpend <= 0) {
+    if (!rawInput || isNaN(rawInput) || rawInput <= 0) {
       return interaction.reply({
-        embeds: [new EmbedBuilder().setTitle('❌ Invalid Amount').setColor(0xED4245).setDescription('Enter a valid number of credits.')],
+        embeds: [new EmbedBuilder().setTitle('❌ Invalid Amount').setColor(0xED4245).setDescription('Enter a valid number.')],
         ephemeral: true
       });
     }
-    if (creditsToSpend < project.minCredits) {
+
+    // Premium: must be whole hours (input is already in hours, just needs to be ≥ 1)
+    if (num === 2 && hoursEntered < 1) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ Below Minimum')
+            .setColor(0xED4245)
+            .setDescription(`**Premium** minimum is **1 hour** (= 3 credits).\nYou entered **${hoursEntered}h**.`)
+            .setFooter({ text: 'Lion Notifier' })
+        ],
+        ephemeral: true
+      });
+    }
+
+    // Basic: minimum credits check
+    if (num !== 2 && creditsToSpend < project.minCredits) {
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
@@ -1526,13 +1702,18 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
+
     if (creditsToSpend > userCredits) {
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ Insufficient Credits')
             .setColor(0xED4245)
-            .setDescription(`You only have **${userCredits} credits** but tried to spend **${creditsToSpend}**.`)
+            .setDescription(
+              num === 2
+                ? `**${hoursEntered}h** costs **${creditsToSpend} credits** but you only have **${userCredits}**.`
+                : `You only have **${userCredits} credits** but tried to spend **${creditsToSpend}**.`
+            )
             .setFooter({ text: 'Lion Notifier' })
         ],
         ephemeral: true
@@ -1552,8 +1733,9 @@ client.on('interactionCreate', async interaction => {
     }
  
     try {
-      const username          = interaction.user.username;
-      const hours             = creditsToHours(num, creditsToSpend);
+      const username = interaction.user.username;
+      // For Premium: hours = hoursEntered (whole number). For others: hours = credits / creditsPerHour.
+      const hours    = num === 2 ? hoursEntered : creditsToHours(num, creditsToSpend);
       const { key, expiry, identifier } = await createLuarmorKey(hours, userId, username, project);
  
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
@@ -1653,7 +1835,7 @@ client.on('interactionCreate', async interaction => {
       });
     }
  
-    const topBid = getTopBid(auction);
+    const topBid  = getTopBid(auction);
     const calcMin = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
  
     if (bidAmount < calcMin) {
@@ -1726,10 +1908,10 @@ client.on('interactionCreate', async interaction => {
           .setColor(0x57F287)
           .setDescription(isFirstBid ? '⏰ **Auction started! 5 minutes on the clock.**' : 'Your bid has been updated.')
           .addFields(
-            { name: '💸 Your Bid',     value: `**${bidAmount} credits**`,         inline: true },
-            { name: '🔒 On Hold',      value: `**${bidAmount} credits**`,         inline: true },
-            { name: '💳 Balance',      value: `**${users[userId].credits}**`,     inline: true },
-            { name: '🏆 Prize',        value: `**${AUCTION_FIXED_HOURS}h flat**`, inline: true },
+            { name: '💸 Your Bid',  value: `**${bidAmount} credits**`,         inline: true },
+            { name: '🔒 On Hold',   value: `**${bidAmount} credits**`,         inline: true },
+            { name: '💳 Balance',   value: `**${users[userId].credits}**`,     inline: true },
+            { name: '🏆 Prize',     value: `**${AUCTION_FIXED_HOURS}h flat**`, inline: true },
           )
           .setFooter({ text: 'If outbid, your credits are refunded instantly  •  Lion Notifier' })
       ],
@@ -1831,4 +2013,3 @@ client.once('ready', async () => {
 });
  
 client.login(process.env.BOT_TOKEN);
- 
