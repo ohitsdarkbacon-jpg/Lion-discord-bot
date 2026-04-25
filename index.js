@@ -20,9 +20,9 @@ const https = require('https');
 const http  = require('http');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
- 
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
- 
+
 // ===== FILES =====
 const USERS_FILE          = './users.json';
 const SLOTS_FILE          = './slots.json';
@@ -31,28 +31,34 @@ const PANEL_STATE_FILE    = './panel_state.json';
 const PAYMENTS_FILE       = './payments.json';
 const CREDITS_BACKUP_FILE = './credits_backup.json';
 const PAUSE_STATE_FILE    = './pause_state.json';
- 
+
 let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
 let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
 let auctions   = fs.existsSync(AUCTIONS_FILE)    ? JSON.parse(fs.readFileSync(AUCTIONS_FILE))    : {};
 let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
 let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PAYMENTS_FILE))    : {};
 let pauseState = fs.existsSync(PAUSE_STATE_FILE) ? JSON.parse(fs.readFileSync(PAUSE_STATE_FILE)) : { paused: false, pausedAt: null };
- 
+
 // ===== PROJECT CONFIG =====
-// Basic:   1 credit  = 1 hour,  minimum 3 credits  (= 3 hours)
-// Premium: 3 credits = 1 hour,  minimum 3 credits  (= 1 hour), must be purchased in multiples of 3 (whole hours only)
+// Basic:   0.5 credits per hour → user enters HOURS (even numbers keep whole credits, but any whole hour is fine)
+//          Cost = Math.ceil(hours * 0.5) credits. Minimum 3 hours (= 2 credits).
+// Premium: 1 credit per hour. Minimum 1 hour (= 1 credit).
+//
+// For simplicity both plans accept whole hours input and compute credits via hoursToCredits().
 const PROJECTS = {
-  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 1, minCredits: 3, creditStep: 1, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
-  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 3, minCredits: 3, creditStep: 3, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
-  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
-  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 0.5, minHours: 3, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
+  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 1,   minHours: 1, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
+  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1,   minHours: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1,   minHours: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
 };
 
-function creditsToHours(projectNum, credits) {
-  return credits / PROJECTS[projectNum].creditsPerHour;
+// How many credits does N whole hours cost for a given project?
+// Basic: 0.5 cr/hr → 1 hr = 0.5 cr, 2 hr = 1 cr, 3 hr = 1.5 → ceil = 2 cr, etc.
+// We ceil so the user always pays a whole number of credits.
+function hoursToCredits(projectNum, hours) {
+  return Math.ceil(hours * PROJECTS[projectNum].creditsPerHour);
 }
- 
+
 const AUCTION_PROJECTS      = [3, 4];
 const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
@@ -64,14 +70,14 @@ const AUCTION_MIN_BID = {
   3: 2,  // Farmer: minimum 2 credits
   4: 6,  // Main:   minimum 6 credits
 };
- 
+
 const WEBHOOK_PORT     = parseInt(process.env.WEBHOOK_PORT || '3000');
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || `http://localhost:${WEBHOOK_PORT}`;
- 
+
 const NOWPAYMENTS_API_KEY    = process.env.NOWPAYMENTS_API_KEY;
 const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
 const NOWPAYMENTS_BASE       = 'https://api.nowpayments.io/v1';
- 
+
 // ===== SAVE FUNCTIONS =====
 function saveUsers()      { fs.writeFileSync(USERS_FILE,       JSON.stringify(users,      null, 2)); }
 function saveSlots()      { fs.writeFileSync(SLOTS_FILE,       JSON.stringify(slots,      null, 2)); }
@@ -79,7 +85,7 @@ function saveAuctions()   { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(au
 function savePanelState() { fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
 function savePayments()   { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
 function savePauseState() { fs.writeFileSync(PAUSE_STATE_FILE, JSON.stringify(pauseState, null, 2)); }
- 
+
 function saveCreditsBackup() {
   const backup = {};
   for (const [userId, data] of Object.entries(users)) {
@@ -91,7 +97,7 @@ function loadCreditsBackup() {
   if (!fs.existsSync(CREDITS_BACKUP_FILE)) return null;
   return JSON.parse(fs.readFileSync(CREDITS_BACKUP_FILE));
 }
- 
+
 // ===== COMMANDS =====
 const commands = [
   new SlashCommandBuilder().setName('panel').setDescription('Open the Lion Notifier slot panel'),
@@ -119,14 +125,12 @@ const commands = [
     .setName('resetauction')
     .setDescription('(Admin) Reset an auction slot to idle (refunds all bidders)')
     .addStringOption(opt => opt.setName('auction_id').setDescription('e.g. auction_3_1').setRequired(true)),
-  // PAUSE / UNPAUSE
   new SlashCommandBuilder()
     .setName('pause')
     .setDescription('(Admin) Pause the slot system — stops slot countdowns and new purchases'),
   new SlashCommandBuilder()
     .setName('unpause')
     .setDescription('(Admin) Unpause the slot system — adds paused time to all active Luarmor keys'),
-  // EXPORT / IMPORT
   new SlashCommandBuilder()
     .setName('exportcredits')
     .setDescription('(Admin) Export all user credit balances as a downloadable JSON file'),
@@ -137,9 +141,9 @@ const commands = [
       opt.setName('file').setDescription('The exported credits JSON file').setRequired(true)
     ),
 ].map(c => c.toJSON());
- 
+
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
- 
+
 async function registerCommands() {
   await rest.put(
     Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
@@ -147,12 +151,13 @@ async function registerCommands() {
   );
   console.log('✅ Commands registered');
 }
- 
+
 // ===== USER IDENTIFIER =====
-function getUserIdentifier(userId, username) {
-  return crypto.createHash('sha256').update(`${userId}:${username}`).digest('hex').slice(0, 32);
+// BUG FIX: Use userId only (not username) so the identifier stays stable even if the user renames.
+function getUserIdentifier(userId) {
+  return crypto.createHash('sha256').update(userId).digest('hex').slice(0, 32);
 }
- 
+
 // ===== ENSURE USER =====
 function ensureUser(userId) {
   if (!users[userId]) users[userId] = { credits: 0, processed: [] };
@@ -174,9 +179,9 @@ async function pauseSystem() {
 async function unpauseSystem() {
   if (!pauseState.paused) return { success: false };
   const pausedDuration = Date.now() - pauseState.pausedAt;
-  pauseState.paused   = false;
-  const pausedAt      = pauseState.pausedAt;
-  pauseState.pausedAt = null;
+  pauseState.paused    = false;
+  const pausedAt       = pauseState.pausedAt;
+  pauseState.pausedAt  = null;
   savePauseState();
   console.log(`▶️  System unpaused — paused for ${formatTime(pausedDuration)}`);
 
@@ -206,11 +211,11 @@ async function unpauseSystem() {
   console.log(`✅ Extended ${extended} active slot(s) by ${formatTime(pausedDuration)}`);
   return { success: true, pausedDuration, extended };
 }
- 
+
 // ===== LUARMOR KEY GENERATOR =====
 async function createLuarmorKey(hours, discordId, username, project) {
   const expiryUnix = Math.floor(Date.now() / 1000) + Math.floor(hours * 3600);
-  const identifier = getUserIdentifier(discordId, username);
+  const identifier = getUserIdentifier(discordId);
   try {
     const res = await axios.post(
       `https://api.luarmor.net/v3/projects/${project.id}/users`,
@@ -232,7 +237,7 @@ async function createLuarmorKey(hours, discordId, username, project) {
     throw new Error(typeof errorData === 'string' ? errorData : JSON.stringify(errorData, null, 2));
   }
 }
- 
+
 // ===== HELPERS =====
 function formatTime(ms) {
   if (ms <= 0) return '0m';
@@ -241,18 +246,18 @@ function formatTime(ms) {
   const m = totalMins % 60;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
- 
+
 function getActiveSlots(projectNum) {
   return slots.filter(s => s?.projectNum === projectNum && s.expiry > Date.now()).length;
 }
- 
+
 function isAuctionSlotOnCooldown(projectNum, slotIndex) {
   const aId     = getAuctionId(projectNum, slotIndex);
   const auction = auctions[aId];
   if (!auction || !auction.cooldownUntil) return false;
   return auction.cooldownUntil > Date.now();
 }
- 
+
 // ===== QR CODE =====
 async function generateQRBuffer(text) {
   return QRCode.toBuffer(text, { type: 'png', width: 200, margin: 2 });
@@ -265,11 +270,11 @@ function slotStatusBadge(active, max) {
   if (pct >= 0.7) return '🟡';
   return '🟢';
 }
- 
+
 // ========================================
 // ========= NOWPAYMENTS HELPERS ==========
 // ========================================
- 
+
 function verifyNowPaymentsSignature(rawBody, signature) {
   if (!NOWPAYMENTS_IPN_SECRET) {
     console.warn('⚠️  NOWPAYMENTS_IPN_SECRET not set — skipping signature check (unsafe in production!)');
@@ -291,12 +296,12 @@ function verifyNowPaymentsSignature(rawBody, signature) {
     return false;
   }
 }
- 
+
 function sortObjectKeys(obj) {
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return obj;
   return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortObjectKeys(obj[k]); return acc; }, {});
 }
- 
+
 async function createNowPayment(userId, currency, usdAmount) {
   const orderId = `${userId}_${Date.now()}`;
   const res = await axios.post(
@@ -315,7 +320,7 @@ async function createNowPayment(userId, currency, usdAmount) {
   );
   return { ...res.data, _orderId: orderId };
 }
- 
+
 async function pollPaymentStatus(paymentId) {
   const res = await axios.get(
     `${NOWPAYMENTS_BASE}/payment/${paymentId}`,
@@ -323,25 +328,25 @@ async function pollPaymentStatus(paymentId) {
   );
   return res.data;
 }
- 
+
 async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrency) {
   const record = payments[paymentId];
   if (!record) {
     console.warn(`⚠️  deliverCredits: no local record found for payment_id=${paymentId}`);
     return;
   }
- 
+
   const { userId, usdAmount, payAmount } = record;
   ensureUser(userId);
- 
+
   const dedupKey = `np_${paymentId}`;
   if (users[userId].processed.includes(dedupKey)) {
     console.log(`⏭️  Payment ${paymentId} already credited to ${userId} — skipping`);
     return;
   }
- 
+
   let usdValue = 0;
- 
+
   if (paymentStatus === 'finished' || paymentStatus === 'confirmed') {
     usdValue = parseFloat(usdAmount) || 0;
   } else if (paymentStatus === 'partially_paid') {
@@ -352,27 +357,27 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
     }
     console.log(`⚠️  Partial payment ${paymentId}: paid=${paid} / expected=${expected} → $${usdValue.toFixed(4)} USD`);
   }
- 
+
   const credits = Math.floor(usdValue);
- 
+
   if (credits <= 0) {
     console.log(`⚠️  Payment ${paymentId} for ${userId} resolved to 0 credits (usdValue=${usdValue.toFixed(6)}) — not crediting`);
     return;
   }
- 
+
   users[userId].credits += credits;
   users[userId].processed.push(dedupKey);
   if (users[userId].processed.length > 200) users[userId].processed = users[userId].processed.slice(-200);
   saveUsers();
   saveCreditsBackup();
- 
+
   record.status       = 'credited';
   record.creditedAt   = Date.now();
   record.creditsGiven = credits;
   savePayments();
- 
+
   console.log(`💰 Credited ${credits} credits to ${userId} (payment ${paymentId}, ~$${usdValue.toFixed(2)} via ${payCurrency})`);
- 
+
   try {
     const discordUser = await client.users.fetch(userId);
     await discordUser.send({
@@ -382,10 +387,10 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
           .setColor(0x57F287)
           .setDescription('Your crypto payment has been verified and credits have landed in your account.')
           .addFields(
-            { name: '🪙 Coin',           value: (payCurrency || 'crypto').toUpperCase(), inline: true },
-            { name: '💵 USD Value',      value: `~$${usdValue.toFixed(2)}`,              inline: true },
-            { name: '✅ Credits Added',  value: `**+${credits}**`,                        inline: true },
-            { name: '💳 New Balance',    value: `**${users[userId].credits} credits**`,  inline: true },
+            { name: '🪙 Coin',          value: (payCurrency || 'crypto').toUpperCase(), inline: true },
+            { name: '💵 USD Value',     value: `~$${usdValue.toFixed(2)}`,              inline: true },
+            { name: '✅ Credits Added', value: `**+${credits}**`,                        inline: true },
+            { name: '💳 New Balance',   value: `**${users[userId].credits} credits**`,  inline: true },
           )
           .setFooter({ text: 'Credits are rounded down to the nearest dollar  •  Lion Notifier' })
           .setTimestamp()
@@ -394,45 +399,53 @@ async function deliverCredits(paymentId, paymentStatus, actuallyPaid, payCurrenc
   } catch (err) {
     console.error(`❌ Could not DM user ${userId}:`, err.message);
   }
- 
+
   updatePanelMessage().catch(() => {});
 }
- 
+
+// BUG FIX: Guard against concurrent poll runs to avoid double-crediting race conditions.
+let _pollRunning = false;
 async function pollPendingPayments() {
-  const pending = Object.entries(payments).filter(([, p]) => p.status === 'waiting');
-  if (pending.length === 0) return;
- 
-  console.log(`🔄 Polling ${pending.length} pending payment(s)...`);
- 
-  for (const [paymentId, record] of pending) {
-    if (Date.now() - record.createdAt < 2 * 60 * 1000) continue;
- 
-    if (Date.now() - record.createdAt > 90 * 60 * 1000) {
-      payments[paymentId].status = 'expired';
-      savePayments();
-      console.log(`🕒 Payment ${paymentId} expired (90 min timeout)`);
-      continue;
-    }
- 
-    try {
-      const data = await pollPaymentStatus(paymentId);
-      console.log(`🔍 Poll ${paymentId}: status=${data.payment_status}`);
- 
-      const actionable = ['finished', 'confirmed', 'partially_paid'];
-      if (actionable.includes(data.payment_status)) {
-        await deliverCredits(paymentId, data.payment_status, data.actually_paid, data.pay_currency);
-      } else if (['failed', 'refunded', 'expired'].includes(data.payment_status)) {
-        payments[paymentId].status = data.payment_status;
+  if (_pollRunning) return;
+  _pollRunning = true;
+  try {
+    const pending = Object.entries(payments).filter(([, p]) => p.status === 'waiting');
+    if (pending.length === 0) return;
+
+    console.log(`🔄 Polling ${pending.length} pending payment(s)...`);
+
+    for (const [paymentId, record] of pending) {
+      if (Date.now() - record.createdAt < 2 * 60 * 1000) continue;
+
+      if (Date.now() - record.createdAt > 90 * 60 * 1000) {
+        payments[paymentId].status = 'expired';
         savePayments();
+        console.log(`🕒 Payment ${paymentId} expired (90 min timeout)`);
+        continue;
       }
-    } catch (err) {
-      console.error(`❌ Poll error for ${paymentId}:`, err.response?.data || err.message);
+
+      try {
+        const data = await pollPaymentStatus(paymentId);
+        console.log(`🔍 Poll ${paymentId}: status=${data.payment_status}`);
+
+        const actionable = ['finished', 'confirmed', 'partially_paid'];
+        if (actionable.includes(data.payment_status)) {
+          await deliverCredits(paymentId, data.payment_status, data.actually_paid, data.pay_currency);
+        } else if (['failed', 'refunded', 'expired'].includes(data.payment_status)) {
+          payments[paymentId].status = data.payment_status;
+          savePayments();
+        }
+      } catch (err) {
+        console.error(`❌ Poll error for ${paymentId}:`, err.response?.data || err.message);
+      }
+
+      await new Promise(r => setTimeout(r, 600));
     }
- 
-    await new Promise(r => setTimeout(r, 600));
+  } finally {
+    _pollRunning = false;
   }
 }
- 
+
 // ===== WEBHOOK HTTP SERVER =====
 function startWebhookServer() {
   const server = http.createServer((req, res) => {
@@ -440,35 +453,35 @@ function startWebhookServer() {
       res.writeHead(404);
       return res.end('Not found');
     }
- 
+
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
- 
+
       const body = Buffer.concat(chunks).toString('utf8');
       processWebhookBody(body, req.headers).catch(err => {
         console.error('❌ processWebhookBody error:', err.message);
       });
     });
   });
- 
+
   server.listen(WEBHOOK_PORT, () => {
     console.log(`🌐 Webhook server on port ${WEBHOOK_PORT}`);
     console.log(`   IPN URL → ${WEBHOOK_BASE_URL}/nowpayments-webhook`);
   });
 }
- 
+
 async function processWebhookBody(body, headers) {
   if (!body || body.trim() === '') {
     console.warn('⚠️  Empty webhook body received');
     return;
   }
- 
+
   const sig = headers['x-nowpayments-sig'];
   if (!verifyNowPaymentsSignature(body, sig)) return;
- 
+
   let payload;
   try {
     payload = JSON.parse(body);
@@ -476,16 +489,16 @@ async function processWebhookBody(body, headers) {
     console.warn('⚠️  Webhook body is not valid JSON:', body.slice(0, 300));
     return;
   }
- 
+
   const { payment_id, payment_status, actually_paid, pay_currency, order_id, pay_amount, price_amount } = payload;
- 
+
   console.log(`📩 IPN received: payment_id=${payment_id} status=${payment_status} order_id=${order_id}`);
- 
+
   if (!payment_id) {
     console.warn('⚠️  IPN payload missing payment_id — cannot process');
     return;
   }
- 
+
   if (!payments[payment_id]) {
     const userId = order_id ? order_id.split('_')[0] : null;
     if (userId) {
@@ -506,21 +519,21 @@ async function processWebhookBody(body, headers) {
       return;
     }
   }
- 
+
   const actionable = ['finished', 'confirmed', 'partially_paid'];
   if (!actionable.includes(payment_status)) {
     console.log(`   ↪ Status "${payment_status}" not actionable — ignoring`);
     return;
   }
- 
+
   await deliverCredits(payment_id, payment_status, actually_paid, pay_currency);
 }
- 
+
 // ===== PANEL EMBED =====
 function generatePanelEmbed() {
   const basicActive   = getActiveSlots(1);
   const premiumActive = getActiveSlots(2);
-  const paused = isSystemPaused();
+  const paused        = isSystemPaused();
 
   const embed = new EmbedBuilder()
     .setTitle('🦁 Lion Notifier — Slot Panel')
@@ -535,8 +548,8 @@ function generatePanelEmbed() {
       {
         name: '🔵 Basic Plan',
         value: [
-          `> 💰 **1 credit = 1 hour**`,
-          `> ⏱️  Minimum purchase: **3 credits (3h)**`,
+          `> 💰 **0.5 credits = 1 hour** (2 hours per credit)`,
+          `> ⏱️  Minimum purchase: **3 hours (2 credits)**`,
           `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
           `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
         ].join('\n'),
@@ -545,8 +558,8 @@ function generatePanelEmbed() {
       {
         name: '🟣 Premium Plan',
         value: [
-          `> 💰 **3 credits = 1 hour**`,
-          `> ⏱️  Minimum purchase: **3 credits (1h)** — whole hours only`,
+          `> 💰 **1 credit = 1 hour**`,
+          `> ⏱️  Minimum purchase: **1 hour (1 credit)**`,
           `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
           `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
         ].join('\n'),
@@ -558,12 +571,12 @@ function generatePanelEmbed() {
 
   return embed;
 }
- 
+
 // ===== SLOTS EMBED =====
 function generateSlotsEmbed() {
-  const now = Date.now();
+  const now    = Date.now();
   const paused = isSystemPaused();
-  const embed = new EmbedBuilder()
+  const embed  = new EmbedBuilder()
     .setTitle('📊 Live Slot Overview')
     .setColor(paused ? 0x99AAB5 : 0x5865F2)
     .setTimestamp();
@@ -587,12 +600,12 @@ function generateSlotsEmbed() {
   }
   return embed;
 }
- 
+
 // ===== AUCTION EMBED =====
 function generateAuctionSectionEmbed() {
-  const now = Date.now();
+  const now    = Date.now();
   const paused = isSystemPaused();
-  const embed = new EmbedBuilder()
+  const embed  = new EmbedBuilder()
     .setTitle('🏷️ Bid Slots — Farmer & Main')
     .setColor(paused ? 0x99AAB5 : 0xF5C542)
     .setDescription(
@@ -602,21 +615,20 @@ function generateAuctionSectionEmbed() {
       `> ⚔️ **Main** minimum bid: **6 credits**\n\u200b`
     )
     .setTimestamp();
- 
+
   for (const num of AUCTION_PROJECTS) {
-    const proj = PROJECTS[num];
-    const icon = num === 3 ? '🌾' : '⚔️';
+    const proj   = PROJECTS[num];
+    const icon   = num === 3 ? '🌾' : '⚔️';
     const minBid = AUCTION_MIN_BID[num];
 
     for (let i = 1; i <= BID_SLOTS; i++) {
       const aId     = getAuctionId(num, i);
       const auction = auctions[aId];
       let statusLine, topBidLine, timeLine;
- 
+
       const onCooldown = isAuctionSlotOnCooldown(num, i);
- 
+
       if (onCooldown) {
-        const timeLeft = Math.max(0, auction.cooldownUntil - now);
         statusLine = '🔒 **Occupied** — key active';
         topBidLine = auction._lastWinner ? `<@${auction._lastWinner}>` : '—';
         timeLine   = `unlocks <t:${Math.floor(auction.cooldownUntil / 1000)}:R>`;
@@ -625,18 +637,17 @@ function generateAuctionSectionEmbed() {
         topBidLine = `No bids yet (min **${minBid} cr**)`;
         timeLine   = '—';
       } else if (auction.status === 'live') {
-        const timeLeft = Math.max(0, auction.endsAt - now);
-        const top = getTopBid(auction);
+        const top  = getTopBid(auction);
         statusLine = '🔴 **Live Auction**';
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids yet';
         timeLine   = `<t:${Math.floor(auction.endsAt / 1000)}:R>`;
       } else {
-        const top = getTopBid(auction);
+        const top  = getTopBid(auction);
         statusLine = '⏳ **Finalizing...**';
         topBidLine = top ? `**${top.amount} credits** by <@${top.userId}>` : 'No bids';
         timeLine   = '—';
       }
- 
+
       embed.addFields({
         name:  `${icon} ${proj.name} — Slot ${i}`,
         value: [
@@ -651,7 +662,7 @@ function generateAuctionSectionEmbed() {
   }
   return embed;
 }
- 
+
 // ===== ACTION ROWS =====
 function buildPanelRow() {
   const paused = isSystemPaused();
@@ -669,14 +680,14 @@ function buildPanelRow() {
     new ButtonBuilder()
       .setCustomId('buy_crypto')
       .setLabel('💳 Buy Credits')
-      .setStyle(ButtonStyle.Success),  // always available
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId('view_slots')
       .setLabel('📊 View Slots')
       .setStyle(ButtonStyle.Secondary)
   );
 }
- 
+
 function buildBidRow() {
   const rows   = [];
   const paused = isSystemPaused();
@@ -701,7 +712,7 @@ function buildBidRow() {
   }
   return rows;
 }
- 
+
 // ===== AUTO-UPDATE PANEL =====
 async function updatePanelMessage() {
   if (!panelState.messageId || !panelState.channelId) return;
@@ -716,15 +727,15 @@ async function updatePanelMessage() {
     console.error('❌ Failed to update panel:', err.message);
   }
 }
- 
+
 // ===== AUCTION HELPERS =====
 function getAuctionId(projectNum, slotIndex) { return `auction_${projectNum}_${slotIndex}`; }
- 
+
 function getTopBid(auction) {
   if (!auction?.bids?.length) return null;
   return auction.bids.reduce((a, b) => (a.amount >= b.amount ? a : b));
 }
- 
+
 function ensureAuction(projectNum, slotIndex) {
   const aId = getAuctionId(projectNum, slotIndex);
   if (!auctions[aId]) {
@@ -733,9 +744,11 @@ function ensureAuction(projectNum, slotIndex) {
   }
   return aId;
 }
- 
+
 const endingAuctions = new Set();
- 
+// BUG FIX: Track per-auction timers so late-bid extensions can cancel and replace the old timer.
+const auctionTimers  = new Map();
+
 async function refundBidders(auction, winnerUserId = null) {
   for (const bid of (auction.bids || [])) {
     if (bid.userId === winnerUserId) continue;
@@ -758,20 +771,27 @@ async function refundBidders(auction, winnerUserId = null) {
     } catch {}
   }
 }
- 
+
 async function endAuction(auctionId) {
   const auction = auctions[auctionId];
   if (!auction) return;
   if (auction.status === 'ended' || auction.status === 'idle') return;
   if (endingAuctions.has(auctionId)) return;
   endingAuctions.add(auctionId);
- 
+
+  // BUG FIX: Clear any pending timer so it doesn't fire again after we've already ended.
+  if (auctionTimers.has(auctionId)) {
+    clearTimeout(auctionTimers.get(auctionId));
+    auctionTimers.delete(auctionId);
+  }
+
   auction.status = 'ended';
   saveAuctions();
   await updatePanelMessage();
- 
+
   const topBid = getTopBid(auction);
- 
+
+  // BUG FIX: resetToIdle removes from endingAuctions so future auctions on the same slot work.
   const resetToIdle = (delay = 10_000) => {
     setTimeout(() => {
       if (auctions[auctionId]) {
@@ -790,19 +810,19 @@ async function endAuction(auctionId) {
       endingAuctions.delete(auctionId);
     }, delay);
   };
- 
+
   if (!topBid) {
     console.log(`⚠️ Auction ${auctionId} ended with no bids`);
     return resetToIdle(5_000);
   }
- 
+
   const project = PROJECTS[auction.projectNum];
   ensureUser(topBid.userId);
- 
+
   if (users[topBid.userId].credits < 0) {
     console.warn(`⚠️ ${topBid.userId} has negative credits after winning ${auctionId}`);
   }
- 
+
   let key, expiry, luarmorIdentifier;
   try {
     let username = topBid.userId;
@@ -810,20 +830,20 @@ async function endAuction(auctionId) {
       const u  = await client.users.fetch(topBid.userId);
       username = u.username;
     } catch {}
- 
-    const keyResult      = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
-    key                  = keyResult.key;
-    expiry               = keyResult.expiry;
-    luarmorIdentifier    = keyResult.identifier;
+
+    const keyResult   = await createLuarmorKey(AUCTION_FIXED_HOURS, topBid.userId, username, project);
+    key               = keyResult.key;
+    expiry            = keyResult.expiry;
+    luarmorIdentifier = keyResult.identifier;
   } catch (err) {
     console.error(`❌ Key generation failed for ${auctionId}:`, err.message);
- 
+
     ensureUser(topBid.userId);
     users[topBid.userId].credits += topBid.amount;
     await refundBidders(auction, topBid.userId);
     saveUsers();
     saveCreditsBackup();
- 
+
     try {
       const winner = await client.users.fetch(topBid.userId);
       await winner.send({
@@ -840,21 +860,21 @@ async function endAuction(auctionId) {
         ]
       });
     } catch {}
- 
+
     try {
       if (panelState.channelId) {
         const channel = await client.channels.fetch(panelState.channelId);
         await channel.send(`⚠️ <@${topBid.userId}> won **${auctionId}** but key generation failed. All bids refunded. Error: \`${err.message.slice(0, 200)}\``);
       }
     } catch {}
- 
+
     return resetToIdle(5_000);
   }
- 
+
   auction.cooldownUntil = Date.now() + AUCTION_COOLDOWN_MS;
   auction._lastWinner   = topBid.userId;
   saveAuctions();
- 
+
   slots = slots.filter(s => !(s.userId === topBid.userId && s.projectNum === auction.projectNum));
   slots.push({
     userId:            topBid.userId,
@@ -867,12 +887,12 @@ async function endAuction(auctionId) {
     auctionId,
   });
   saveSlots();
- 
+
   saveUsers();
   saveCreditsBackup();
- 
+
   await updatePanelMessage();
- 
+
   try {
     const discordUser = await client.users.fetch(topBid.userId);
     await discordUser.send({
@@ -882,11 +902,11 @@ async function endAuction(auctionId) {
           .setColor(0x57F287)
           .setDescription(`Congratulations! You placed the winning bid and your key is ready.`)
           .addFields(
-            { name: '🔑 Your Key',          value: `\`${key}\``,                                   inline: false },
-            { name: '⏳ Duration',           value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
-            { name: '📅 Expires',            value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
-            { name: '💳 Credits Spent',      value: `**${topBid.amount}**`,                         inline: true  },
-            { name: '💳 Credits Remaining',  value: `**${users[topBid.userId].credits}**`,          inline: true  }
+            { name: '🔑 Your Key',         value: `\`${key}\``,                                   inline: false },
+            { name: '⏳ Duration',          value: `${AUCTION_FIXED_HOURS} hours (flat)`,          inline: true  },
+            { name: '📅 Expires',           value: `<t:${Math.floor(expiry / 1000)}:R>`,           inline: true  },
+            { name: '💳 Credits Spent',     value: `**${topBid.amount}**`,                         inline: true  },
+            { name: '💳 Credits Remaining', value: `**${users[topBid.userId].credits}**`,          inline: true  }
           )
           .setFooter({ text: 'Keep your key private. The slot is now occupied for 2 hours.  •  Lion Notifier' })
       ]
@@ -914,13 +934,13 @@ async function endAuction(auctionId) {
       console.error(`❌ Fallback channel send also failed:`, fallbackErr.message);
     }
   }
- 
+
   await refundBidders(auction, topBid.userId);
   saveUsers();
   saveCreditsBackup();
- 
+
   console.log(`🏆 Auction ${auctionId} won by ${topBid.userId} for ${topBid.amount} credits | Key: ${key}`);
- 
+
   try {
     if (panelState.channelId) {
       const channel = await client.channels.fetch(panelState.channelId);
@@ -939,15 +959,15 @@ async function endAuction(auctionId) {
       });
     }
   } catch {}
- 
+
   resetToIdle(AUCTION_COOLDOWN_MS);
 }
- 
+
 // ===== COMMAND HANDLER =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const isAdmin = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).includes(interaction.user.id);
- 
+
   if (interaction.commandName === 'panel' && isAdmin) {
     for (const num of AUCTION_PROJECTS) for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
     const reply = await interaction.reply({
@@ -959,16 +979,16 @@ client.on('interactionCreate', async interaction => {
     savePanelState();
     return;
   }
- 
+
   if (interaction.commandName === 'bidpanel' && isAdmin) {
     const lines = [];
     for (const num of AUCTION_PROJECTS) {
       const proj = PROJECTS[num];
       for (let i = 1; i <= BID_SLOTS; i++) {
-        const aId = getAuctionId(num, i);
-        const a   = auctions[aId];
+        const aId        = getAuctionId(num, i);
+        const a          = auctions[aId];
         const onCooldown = isAuctionSlotOnCooldown(num, i);
-        const st  = onCooldown
+        const st         = onCooldown
           ? `🔒 Cooldown (${formatTime(a.cooldownUntil - Date.now())} left)`
           : !a || a.status === 'idle' ? '⚪ Idle' : a.status === 'live' ? '🔴 Live' : '✅ Ended';
         const topBid = a ? getTopBid(a) : null;
@@ -987,7 +1007,7 @@ client.on('interactionCreate', async interaction => {
       ephemeral: true
     });
   }
- 
+
   if (interaction.commandName === 'givecredits' && isAdmin) {
     const target = interaction.options.getUser('user');
     const amount = interaction.options.getInteger('amount');
@@ -1001,16 +1021,16 @@ client.on('interactionCreate', async interaction => {
           .setTitle('✅ Credits Given')
           .setColor(0x57F287)
           .addFields(
-            { name: 'User',        value: target.tag,                          inline: true },
-            { name: 'Added',       value: `**+${amount} credits**`,            inline: true },
-            { name: 'New Balance', value: `**${users[target.id].credits}**`,   inline: true }
+            { name: 'User',        value: target.tag,                        inline: true },
+            { name: 'Added',       value: `**+${amount} credits**`,          inline: true },
+            { name: 'New Balance', value: `**${users[target.id].credits}**`, inline: true }
           )
           .setFooter({ text: 'Lion Notifier Admin' })
       ],
       ephemeral: true
     });
   }
- 
+
   if (interaction.commandName === 'backupcredits' && isAdmin) {
     saveCreditsBackup();
     const count = Object.keys(users).length;
@@ -1026,7 +1046,7 @@ client.on('interactionCreate', async interaction => {
       ephemeral: true
     });
   }
- 
+
   if (interaction.commandName === 'restorecredits' && isAdmin) {
     const backup = loadCreditsBackup();
     if (!backup) {
@@ -1060,7 +1080,7 @@ client.on('interactionCreate', async interaction => {
       ephemeral: true
     });
   }
- 
+
   if (interaction.commandName === 'checkcredits' && isAdmin) {
     const target = interaction.options.getUser('user');
     ensureUser(target.id);
@@ -1070,15 +1090,15 @@ client.on('interactionCreate', async interaction => {
           .setTitle('💳 Credit Balance')
           .setColor(0x5865F2)
           .addFields(
-            { name: 'User',    value: target.tag,                                    inline: true },
-            { name: 'Balance', value: `**${users[target.id].credits} credits**`,     inline: true }
+            { name: 'User',    value: target.tag,                                  inline: true },
+            { name: 'Balance', value: `**${users[target.id].credits} credits**`,   inline: true }
           )
           .setFooter({ text: 'Lion Notifier Admin' })
       ],
       ephemeral: true
     });
   }
- 
+
   if (interaction.commandName === 'forceendauction' && isAdmin) {
     const auctionId = interaction.options.getString('auction_id');
     if (!auctions[auctionId]) {
@@ -1093,7 +1113,7 @@ client.on('interactionCreate', async interaction => {
     await endAuction(auctionId);
     return;
   }
- 
+
   if (interaction.commandName === 'resetauction' && isAdmin) {
     const auctionId = interaction.options.getString('auction_id');
     if (!auctions[auctionId]) {
@@ -1106,6 +1126,12 @@ client.on('interactionCreate', async interaction => {
     await refundBidders(auction, null);
     saveUsers();
     saveCreditsBackup();
+    // BUG FIX: Also clear any pending timer when force-resetting.
+    if (auctionTimers.has(auctionId)) {
+      clearTimeout(auctionTimers.get(auctionId));
+      auctionTimers.delete(auctionId);
+    }
+    endingAuctions.delete(auctionId);
     auctions[auctionId] = {
       projectNum:    auction.projectNum,
       slotIndex:     auction.slotIndex,
@@ -1116,7 +1142,6 @@ client.on('interactionCreate', async interaction => {
       _lastWinner:   null,
     };
     saveAuctions();
-    endingAuctions.delete(auctionId);
     await updatePanelMessage();
     return interaction.reply({
       embeds: [
@@ -1201,11 +1226,9 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ===== EXPORT CREDITS =====
-  // Generates a clean JSON file: { "userId": credits, ... } and sends it as an attachment.
   if (interaction.commandName === 'exportcredits' && isAdmin) {
     await interaction.deferReply({ ephemeral: true });
 
-    // Build the export object — userId → credits only (clean, importable format)
     const exportData = {};
     for (const [userId, data] of Object.entries(users)) {
       exportData[userId] = data.credits || 0;
@@ -1228,8 +1251,8 @@ client.on('interactionCreate', async interaction => {
             `Use \`/importcredits\` and attach this file to restore or migrate balances.`
           )
           .addFields(
-            { name: '👥 Users',         value: `**${userCount}**`,   inline: true },
-            { name: '🪙 Total Credits', value: `**${totalCreds}**`,  inline: true },
+            { name: '👥 Users',         value: `**${userCount}**`,  inline: true },
+            { name: '🪙 Total Credits', value: `**${totalCreds}**`, inline: true },
             { name: '📅 Exported At',   value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false },
           )
           .setFooter({ text: 'Lion Notifier Admin  •  Keep this file safe' })
@@ -1240,13 +1263,11 @@ client.on('interactionCreate', async interaction => {
   }
 
   // ===== IMPORT CREDITS =====
-  // Accepts the exported JSON file, validates it, and sets each user's credits accordingly.
   if (interaction.commandName === 'importcredits' && isAdmin) {
     await interaction.deferReply({ ephemeral: true });
 
     const attachment = interaction.options.getAttachment('file');
 
-    // Basic validation — must be a JSON file
     if (!attachment.name.endsWith('.json')) {
       return interaction.editReply({
         embeds: [
@@ -1259,7 +1280,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Fetch the file content from Discord's CDN
     let rawText;
     try {
       const resp = await axios.get(attachment.url, { responseType: 'text' });
@@ -1276,7 +1296,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Parse JSON
     let importData;
     try {
       importData = typeof rawText === 'string' ? JSON.parse(rawText) : rawText;
@@ -1292,7 +1311,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Validate structure — must be a flat object of { userId: number }
     if (typeof importData !== 'object' || Array.isArray(importData)) {
       return interaction.editReply({
         embeds: [
@@ -1309,13 +1327,12 @@ client.on('interactionCreate', async interaction => {
     let skipped  = 0;
 
     for (const [userId, credits] of Object.entries(importData)) {
-      // Skip entries with non-numeric or negative credits
       if (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0) {
         skipped++;
         continue;
       }
       ensureUser(userId);
-      users[userId].credits = Math.floor(credits); // floor just in case of floats
+      users[userId].credits = Math.floor(credits);
       imported++;
     }
 
@@ -1343,13 +1360,13 @@ client.on('interactionCreate', async interaction => {
     });
   }
 });
- 
+
 // ===== BUTTON HANDLER =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
   const userId = interaction.user.id;
   ensureUser(userId);
- 
+
   if (interaction.customId === 'buy_crypto') {
     const modal = new ModalBuilder()
       .setCustomId('buy_credits_modal')
@@ -1374,11 +1391,11 @@ client.on('interactionCreate', async interaction => {
     );
     return interaction.showModal(modal);
   }
- 
+
   if (interaction.customId === 'view_slots') {
     return interaction.reply({ embeds: [generateSlotsEmbed()], ephemeral: true });
   }
- 
+
   if (['select_project_1', 'select_project_2'].includes(interaction.customId)) {
     if (isSystemPaused()) {
       return interaction.reply({
@@ -1396,15 +1413,17 @@ client.on('interactionCreate', async interaction => {
     const num         = interaction.customId === 'select_project_1' ? 1 : 2;
     const project     = PROJECTS[num];
     const userCredits = users[userId].credits;
- 
-    if (userCredits < project.minCredits) {
+    const minCredits  = hoursToCredits(num, project.minHours);
+
+    if (userCredits < minCredits) {
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ Not Enough Credits')
             .setColor(0xED4245)
             .setDescription(
-              `You need at least **${project.minCredits} credit${project.minCredits !== 1 ? 's' : ''}** to activate a **${project.name}** slot.\n` +
+              `You need at least **${minCredits} credit${minCredits !== 1 ? 's' : ''}** to activate a **${project.name}** slot ` +
+              `(minimum **${project.minHours}h**).\n` +
               `You currently have **${userCredits} credits**.\n\nUse **💳 Buy Credits** to top up.`
             )
             .setFooter({ text: 'Lion Notifier' })
@@ -1424,31 +1443,32 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
+    // Both plans: user enters whole hours.
+    // Basic label shows cost preview since it's non-obvious (0.5 cr/hr).
+    const labelBasic   = `Hours to buy (min ${project.minHours}h = ${minCredits}cr, have ${userCredits}cr) — 0.5cr/hr`;
+    const labelPremium = `Hours to buy (min ${project.minHours}h = ${minCredits}cr, have ${userCredits}cr) — 1cr/hr`;
+
     const modal = new ModalBuilder()
       .setCustomId(`activate_modal_${num}`)
       .setTitle(`Activate ${project.name} Slot`);
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
-          .setCustomId('credits_amount')
-          .setLabel(
-            num === 2
-              ? `Hours to buy (min 1h = 3cr, have ${userCredits}cr)`
-              : `Credits to spend (min ${project.minCredits}, have ${userCredits})`
-          )
+          .setCustomId('hours_input')
+          .setLabel(num === 1 ? labelBasic : labelPremium)
           .setStyle(TextInputStyle.Short)
           .setPlaceholder(
             num === 1
-              ? `e.g. 3 = 3h, 5 = 5h, 10 = 10h`
-              : `e.g. 1 = 3cr, 2 = 6cr, 3 = 9cr (whole hours)`
+              ? `e.g. 3 = 2cr, 4 = 2cr, 6 = 3cr, 10 = 5cr`
+              : `e.g. 1 = 1cr, 3 = 3cr, 6 = 6cr`
           )
           .setRequired(true)
       )
     );
     return interaction.showModal(modal);
   }
- 
+
   if (interaction.customId.startsWith('place_bid_')) {
     if (isSystemPaused()) {
       return interaction.reply({
@@ -1470,7 +1490,7 @@ client.on('interactionCreate', async interaction => {
     ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
     const minBid    = AUCTION_MIN_BID[projNum] || 1;
- 
+
     if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
       const timeLeft = formatTime(auction.cooldownUntil - Date.now());
       return interaction.reply({
@@ -1484,7 +1504,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     if (auction.status === 'ended') {
       return interaction.reply({
         embeds: [
@@ -1497,11 +1517,11 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     const topBid      = getTopBid(auction);
     const existingBid = auction.bids.find(b => b.userId === userId);
     const calcMin     = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
- 
+
     const modal = new ModalBuilder()
       .setCustomId(`bid_modal_${auctionId}`)
       .setTitle(`Bid — ${PROJECTS[auction.projectNum].name} Slot ${auction.slotIndex}`);
@@ -1518,20 +1538,20 @@ client.on('interactionCreate', async interaction => {
     return interaction.showModal(modal);
   }
 });
- 
+
 // ===== MODAL HANDLER =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isModalSubmit()) return;
   const userId = interaction.user.id;
   ensureUser(userId);
- 
+
   if (interaction.customId === 'buy_credits_modal') {
     await interaction.deferReply({ ephemeral: true });
- 
+
     const rawUsd    = interaction.fields.getTextInputValue('usd_amount').trim();
     const rawCoin   = interaction.fields.getTextInputValue('crypto_choice').trim().toLowerCase();
     const usdAmount = parseInt(rawUsd);
- 
+
     if (isNaN(usdAmount) || usdAmount < 1) {
       return interaction.editReply({
         embeds: [
@@ -1554,11 +1574,11 @@ client.on('interactionCreate', async interaction => {
         ]
       });
     }
- 
+
     try {
       const paymentData = await createNowPayment(userId, rawCoin, usdAmount);
       const { payment_id, pay_address, pay_amount, pay_currency, expiration_estimate_date } = paymentData;
- 
+
       if (!payment_id || !pay_address) {
         console.error('NowPayments incomplete response:', JSON.stringify(paymentData));
         return interaction.editReply({
@@ -1571,7 +1591,7 @@ client.on('interactionCreate', async interaction => {
           ]
         });
       }
- 
+
       payments[payment_id] = {
         userId,
         usdAmount,
@@ -1583,15 +1603,15 @@ client.on('interactionCreate', async interaction => {
         expiresAt:  expiration_estimate_date ? new Date(expiration_estimate_date).getTime() : null,
       };
       savePayments();
- 
+
       console.log(`🧾 Invoice created: payment_id=${payment_id} userId=${userId} amount=${usdAmount} USD via ${pay_currency}`);
- 
+
       let qrAttach = null;
       const qrFile = `${rawCoin}_qr.png`;
       try {
         qrAttach = new AttachmentBuilder(await generateQRBuffer(pay_address), { name: qrFile });
       } catch {}
- 
+
       const coinLabel = (pay_currency || rawCoin).toUpperCase();
       const embed = new EmbedBuilder()
         .setTitle(`💳 ${coinLabel} Invoice — ${usdAmount} Credits`)
@@ -1603,22 +1623,22 @@ client.on('interactionCreate', async interaction => {
           '⚠️ Only send the **exact coin** to this address.'
         )
         .addFields(
-          { name: `📬 ${coinLabel} Address`,    value: `\`\`\`${pay_address}\`\`\``,          inline: false },
-          { name: '💸 Amount to Send',          value: `**${pay_amount} ${coinLabel}**`,       inline: true  },
-          { name: "🎁 Credits You'll Receive",  value: `**${usdAmount} credits**`,             inline: true  },
-          { name: '🆔 Payment ID',              value: `\`${payment_id}\``,                    inline: false },
+          { name: `📬 ${coinLabel} Address`,   value: `\`\`\`${pay_address}\`\`\``,    inline: false },
+          { name: '💸 Amount to Send',         value: `**${pay_amount} ${coinLabel}**`, inline: true  },
+          { name: "🎁 Credits You'll Receive", value: `**${usdAmount} credits**`,       inline: true  },
+          { name: '🆔 Payment ID',             value: `\`${payment_id}\``,              inline: false },
         )
         .setFooter({ text: 'Invoice expires in ~20 min — create a new one if it expires  •  Lion Notifier' });
- 
+
       if (expiration_estimate_date) {
         const expireTs = Math.floor(new Date(expiration_estimate_date).getTime() / 1000);
         embed.addFields({ name: '⏰ Expires', value: `<t:${expireTs}:R>`, inline: true });
       }
- 
+
       if (qrAttach) embed.setImage(`attachment://${qrFile}`);
- 
+
       return interaction.editReply({ embeds: [embed], files: qrAttach ? [qrAttach] : [] });
- 
+
     } catch (err) {
       const msg = err.response?.data?.message || err.message;
       console.error('createNowPayment error:', err.response?.data || err.message);
@@ -1633,7 +1653,7 @@ client.on('interactionCreate', async interaction => {
       });
     }
   }
- 
+
   if (interaction.customId.startsWith('activate_modal_')) {
     if (isSystemPaused()) {
       return interaction.reply({
@@ -1648,79 +1668,56 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    const num     = parseInt(interaction.customId.split('_')[2]);
-    const project = PROJECTS[num];
-    const rawInput = parseInt(interaction.fields.getTextInputValue('credits_amount'));
+    // BUG FIX: Defer before the Luarmor API call to avoid interaction timeout.
+    await interaction.deferReply({ ephemeral: true });
+
+    const num         = parseInt(interaction.customId.split('_')[2]);
+    const project     = PROJECTS[num];
     const userCredits = users[userId].credits;
 
-    // For Premium (project 2) the user enters HOURS; convert to credits.
-    // For all others, the user enters CREDITS directly.
-    let creditsToSpend;
-    let hoursEntered = null;
-    if (num === 2) {
-      // Premium: input = hours, credits = hours × 3
-      hoursEntered   = rawInput;
-      creditsToSpend = hoursEntered * project.creditsPerHour; // hours × 3
-    } else {
-      creditsToSpend = rawInput;
-    }
- 
-    if (!rawInput || isNaN(rawInput) || rawInput <= 0) {
-      return interaction.reply({
-        embeds: [new EmbedBuilder().setTitle('❌ Invalid Amount').setColor(0xED4245).setDescription('Enter a valid number.')],
-        ephemeral: true
+    // Both plans: user always inputs whole HOURS.
+    const hoursInput = parseInt(interaction.fields.getTextInputValue('hours_input'));
+
+    if (isNaN(hoursInput) || hoursInput <= 0) {
+      return interaction.editReply({
+        embeds: [new EmbedBuilder().setTitle('❌ Invalid Input').setColor(0xED4245).setDescription('Enter a valid whole number of hours.')],
       });
     }
 
-    // Premium: must be whole hours (input is already in hours, just needs to be ≥ 1)
-    if (num === 2 && hoursEntered < 1) {
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle('❌ Below Minimum')
-            .setColor(0xED4245)
-            .setDescription(`**Premium** minimum is **1 hour** (= 3 credits).\nYou entered **${hoursEntered}h**.`)
-            .setFooter({ text: 'Lion Notifier' })
-        ],
-        ephemeral: true
-      });
-    }
-
-    // Basic: minimum credits check
-    if (num !== 2 && creditsToSpend < project.minCredits) {
-      return interaction.reply({
+    if (hoursInput < project.minHours) {
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ Below Minimum')
             .setColor(0xED4245)
             .setDescription(
-              `The minimum for **${project.name}** is **${project.minCredits} credit${project.minCredits !== 1 ? 's' : ''}**.\n` +
-              `You entered **${creditsToSpend}**.`
+              `**${project.name}** minimum is **${project.minHours} hour${project.minHours !== 1 ? 's' : ''}**.\n` +
+              `You entered **${hoursInput}h**.`
             )
             .setFooter({ text: 'Lion Notifier' })
         ],
-        ephemeral: true
       });
     }
 
+    const creditsToSpend = hoursToCredits(num, hoursInput);
+
     if (creditsToSpend > userCredits) {
-      return interaction.reply({
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ Insufficient Credits')
             .setColor(0xED4245)
             .setDescription(
-              num === 2
-                ? `**${hoursEntered}h** costs **${creditsToSpend} credits** but you only have **${userCredits}**.`
-                : `You only have **${userCredits} credits** but tried to spend **${creditsToSpend}**.`
+              `**${hoursInput}h** costs **${creditsToSpend} credit${creditsToSpend !== 1 ? 's' : ''}** ` +
+              `but you only have **${userCredits}**.`
             )
             .setFooter({ text: 'Lion Notifier' })
         ],
-        ephemeral: true
       });
     }
+
     if (getActiveSlots(num) >= project.maxSlots) {
-      return interaction.reply({
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ No Slots Available')
@@ -1728,16 +1725,13 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`All **${project.name}** slots are currently full.`)
             .setFooter({ text: 'Lion Notifier' })
         ],
-        ephemeral: true
       });
     }
- 
+
     try {
-      const username = interaction.user.username;
-      // For Premium: hours = hoursEntered (whole number). For others: hours = credits / creditsPerHour.
-      const hours    = num === 2 ? hoursEntered : creditsToHours(num, creditsToSpend);
-      const { key, expiry, identifier } = await createLuarmorKey(hours, userId, username, project);
- 
+      const username        = interaction.user.username;
+      const { key, expiry, identifier } = await createLuarmorKey(hoursInput, userId, username, project);
+
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
       slots.push({ userId, key, expiry, project: project.name, projectNum: num, luarmorIdentifier: identifier });
       users[userId].credits -= creditsToSpend;
@@ -1746,9 +1740,7 @@ client.on('interactionCreate', async interaction => {
       saveCreditsBackup();
       updatePanelMessage();
 
-      const hoursDisplay = hours % 1 === 0 ? `${hours}h` : `${Math.floor(hours)}h ${Math.round((hours % 1) * 60)}m`;
- 
-      return interaction.reply({
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setTitle(`✅ ${project.name} Slot Activated`)
@@ -1756,17 +1748,16 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`Your slot is live and your key is ready to use!`)
             .addFields(
               { name: '🔑 Your Key',          value: `\`${key}\``,                         inline: false },
-              { name: '⏳ Duration',           value: hoursDisplay,                          inline: true  },
+              { name: '⏳ Duration',           value: `${hoursInput}h`,                     inline: true  },
               { name: '📅 Expires',            value: `<t:${Math.floor(expiry / 1000)}:R>`, inline: true  },
               { name: '💳 Credits Spent',      value: `**${creditsToSpend}**`,              inline: true  },
               { name: '💳 Credits Remaining',  value: `**${users[userId].credits}**`,       inline: true  }
             )
             .setFooter({ text: 'Keep your key private  •  Lion Notifier' })
         ],
-        ephemeral: true
       });
     } catch (err) {
-      return interaction.reply({
+      return interaction.editReply({
         embeds: [
           new EmbedBuilder()
             .setTitle('❌ Luarmor Error')
@@ -1774,11 +1765,10 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`\`\`\`${err.message.slice(0, 1800)}\`\`\``)
             .setFooter({ text: 'Lion Notifier' })
         ],
-        ephemeral: true
       });
     }
   }
- 
+
   if (interaction.customId.startsWith('bid_modal_')) {
     if (isSystemPaused()) {
       return interaction.reply({
@@ -1800,7 +1790,7 @@ client.on('interactionCreate', async interaction => {
     ensureAuction(projNum, slotIdx);
     const auction   = auctions[auctionId];
     const minBid    = AUCTION_MIN_BID[projNum] || 1;
- 
+
     if (isAuctionSlotOnCooldown(projNum, slotIdx)) {
       return interaction.reply({
         embeds: [
@@ -1813,7 +1803,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     if (auction.status === 'ended') {
       return interaction.reply({
         embeds: [
@@ -1826,7 +1816,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     const bidAmount = parseInt(interaction.fields.getTextInputValue('bid_amount'));
     if (isNaN(bidAmount) || bidAmount <= 0) {
       return interaction.reply({
@@ -1834,10 +1824,10 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     const topBid  = getTopBid(auction);
     const calcMin = Math.max(minBid, topBid ? topBid.amount + 1 : minBid);
- 
+
     if (bidAmount < calcMin) {
       return interaction.reply({
         embeds: [
@@ -1850,12 +1840,12 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     ensureUser(userId);
     const existingBid    = auction.bids.find(b => b.userId === userId);
     const existingAmount = existingBid ? existingBid.amount : 0;
     const additionalCost = bidAmount - existingAmount;
- 
+
     if (additionalCost > users[userId].credits) {
       return interaction.reply({
         embeds: [
@@ -1871,7 +1861,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
- 
+
     if (existingBid) {
       users[userId].credits -= additionalCost;
       existingBid.amount = bidAmount;
@@ -1881,25 +1871,28 @@ client.on('interactionCreate', async interaction => {
     }
     saveUsers();
     saveCreditsBackup();
- 
+
     const isFirstBid = auction.status === 'idle';
     if (isFirstBid) {
       auction.status = 'live';
       auction.endsAt = Date.now() + AUCTION_DURATION_MINS * 60 * 1000;
-      setTimeout(() => endAuction(auctionId), AUCTION_DURATION_MINS * 60 * 1000);
+      const t = setTimeout(() => endAuction(auctionId), AUCTION_DURATION_MINS * 60 * 1000);
+      auctionTimers.set(auctionId, t);
       console.log(`⏰ Auction ${auctionId} started by ${userId}`);
+    } else {
+      // BUG FIX: If < 60s left, extend to 60s and replace the old timer atomically.
+      const timeLeft = auction.endsAt - Date.now();
+      if (timeLeft < 60_000) {
+        auction.endsAt = Date.now() + 60_000;
+        if (auctionTimers.has(auctionId)) clearTimeout(auctionTimers.get(auctionId));
+        const t = setTimeout(() => endAuction(auctionId), 60_000);
+        auctionTimers.set(auctionId, t);
+      }
     }
- 
-    const timeLeft = auction.endsAt ? (auction.endsAt - Date.now()) : 0;
-    if (!isFirstBid && timeLeft < 60_000) {
-      auction.endsAt = Date.now() + 60_000;
-      endingAuctions.delete(auctionId);
-      setTimeout(() => endAuction(auctionId), 60_000);
-    }
- 
+
     saveAuctions();
     await updatePanelMessage();
- 
+
     const proj = PROJECTS[auction.projectNum];
     return interaction.reply({
       embeds: [
@@ -1908,10 +1901,10 @@ client.on('interactionCreate', async interaction => {
           .setColor(0x57F287)
           .setDescription(isFirstBid ? '⏰ **Auction started! 5 minutes on the clock.**' : 'Your bid has been updated.')
           .addFields(
-            { name: '💸 Your Bid',  value: `**${bidAmount} credits**`,         inline: true },
-            { name: '🔒 On Hold',   value: `**${bidAmount} credits**`,         inline: true },
-            { name: '💳 Balance',   value: `**${users[userId].credits}**`,     inline: true },
-            { name: '🏆 Prize',     value: `**${AUCTION_FIXED_HOURS}h flat**`, inline: true },
+            { name: '💸 Your Bid', value: `**${bidAmount} credits**`,         inline: true },
+            { name: '🔒 On Hold',  value: `**${bidAmount} credits**`,         inline: true },
+            { name: '💳 Balance',  value: `**${users[userId].credits}**`,     inline: true },
+            { name: '🏆 Prize',    value: `**${AUCTION_FIXED_HOURS}h flat**`, inline: true },
           )
           .setFooter({ text: 'If outbid, your credits are refunded instantly  •  Lion Notifier' })
       ],
@@ -1919,18 +1912,18 @@ client.on('interactionCreate', async interaction => {
     });
   }
 });
- 
+
 // ===== INTERVALS =====
- 
+
 setInterval(() => {
-  if (isSystemPaused()) return; // don't clean slots while paused
+  if (isSystemPaused()) return;
   const before = slots.length;
   slots = slots.filter(s => s && s.expiry > Date.now());
   if (slots.length !== before) { saveSlots(); console.log(`🧹 Cleaned ${before - slots.length} expired slot(s)`); }
 }, 60_000);
- 
+
 setInterval(() => updatePanelMessage(), 30_000);
- 
+
 setInterval(() => {
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
@@ -1938,18 +1931,18 @@ setInterval(() => {
     else updatePanelMessage();
   }
 }, 10_000);
- 
+
 setInterval(() => {
   pollPendingPayments().catch(err => console.error('❌ pollPendingPayments error:', err.message));
 }, 2 * 60 * 1000);
- 
+
 // ===== READY =====
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await registerCommands();
- 
+
   for (const num of AUCTION_PROJECTS) for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
- 
+
   // Resume live auctions
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
@@ -1957,11 +1950,12 @@ client.once('ready', async () => {
     if (remaining <= 0) {
       endAuction(auctionId);
     } else {
-      setTimeout(() => endAuction(auctionId), remaining);
+      const t = setTimeout(() => endAuction(auctionId), remaining);
+      auctionTimers.set(auctionId, t);
       console.log(`⏰ Resuming auction ${auctionId} — ends in ${Math.ceil(remaining / 1000)}s`);
     }
   }
- 
+
   // Resume cooldown timers
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) {
@@ -1999,17 +1993,17 @@ client.once('ready', async () => {
       }
     }, remaining);
   }
- 
+
   https.get('https://api.ipify.org?format=json', res => {
     let data = '';
     res.on('data', c => data += c);
     res.on('end', () => { try { console.log('🌐 Outbound IP:', JSON.parse(data).ip); } catch {} });
   });
- 
+
   startWebhookServer();
- 
+
   setTimeout(() => pollPendingPayments().catch(() => {}), 10_000);
   setTimeout(() => updatePanelMessage().catch(() => {}), 5_000);
 });
- 
+
 client.login(process.env.BOT_TOKEN);
