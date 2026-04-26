@@ -43,8 +43,8 @@ let pauseState = fs.existsSync(PAUSE_STATE_FILE) ? JSON.parse(fs.readFileSync(PA
 // Basic:   1 credit  = 1 hour,  minimum 3 credits  (= 3 hours)
 // Premium: 3 credits = 1 hour,  minimum 3 credits  (= 1 hour), must be purchased in multiples of 3 (whole hours only)
 const PROJECTS = {
-  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 1, minCredits: 3, creditStep: 1, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
-  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 3, minCredits: 3, creditStep: 3, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
+  1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 0.5, minCredits: 1, creditStep: 1, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
+  2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 2,   minCredits: 2, creditStep: 2, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
   3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
   4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
 };
@@ -533,30 +533,24 @@ function generatePanelEmbed() {
     )
     .addFields(
       {
-        name: '🔵 Basic Plan',
-        value: [
-          `> 💰 **1 credit = 1 hour**`,
-          `> ⏱️  Minimum purchase: **3 credits (3h)**`,
-          `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
-          `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
-        ].join('\n'),
-        inline: true
-      },
-      {
-        name: '🟣 Premium Plan',
-        value: [
-          `> 💰 **3 credits = 1 hour**`,
-          `> ⏱️  Minimum purchase: **3 credits (1h)** — whole hours only`,
-          `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
-          `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
-        ].join('\n'),
-        inline: true
-      }
-    )
-    .setFooter({ text: paused ? '⏸️  SYSTEM PAUSED  •  Lion Notifier' : 'Use the buttons below to activate a slot or top up credits  •  Lion Notifier' })
-    .setTimestamp();
-
-  return embed;
+  name: '🔵 Basic Plan',
+  value: [
+    `> 💰 **1 credit = 2 hours** (0.5cr per hour)`,
+    `> ⏱️  Minimum purchase: **1 credit (2h)** — whole hours only`,
+    `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
+    `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+  ].join('\n'),
+  inline: true
+},
+{
+  name: '🟣 Premium Plan',
+  value: [
+    `> 💰 **2 credits = 1 hour**`,
+    `> ⏱️  Minimum purchase: **2 credits (1h)** — whole hours only`,
+    `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
+    `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+  ].join('\n'),
+  inline: true
 }
  
 // ===== SLOTS EMBED =====
@@ -1655,22 +1649,29 @@ client.on('interactionCreate', async interaction => {
 
     // For Premium (project 2) the user enters HOURS; convert to credits.
     // For all others, the user enters CREDITS directly.
-    let creditsToSpend;
-    let hoursEntered = null;
-    if (num === 2) {
-      // Premium: input = hours, credits = hours × 3
-      hoursEntered   = rawInput;
-      creditsToSpend = hoursEntered * project.creditsPerHour; // hours × 3
-    } else {
-      creditsToSpend = rawInput;
-    }
- 
-    if (!rawInput || isNaN(rawInput) || rawInput <= 0) {
-      return interaction.reply({
-        embeds: [new EmbedBuilder().setTitle('❌ Invalid Amount').setColor(0xED4245).setDescription('Enter a valid number.')],
-        ephemeral: true
-      });
-    }
+   // Replace the num === 2 branch with this — both plans now take hours as input
+let creditsToSpend;
+let hoursEntered = rawInput; // both plans now input hours
+
+if (num === 2) {
+  creditsToSpend = hoursEntered * 2;   // 2 credits per hour
+} else {
+  creditsToSpend = hoursEntered * 0.5; // 0.5 credits per hour
+}
+
+// Minimum check for both — 1 whole hour minimum
+if (hoursEntered < 1) {
+  return interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle('❌ Below Minimum')
+        .setColor(0xED4245)
+        .setDescription(`Minimum is **1 hour**.\nYou entered **${hoursEntered}h**.`)
+        .setFooter({ text: 'Lion Notifier' })
+    ],
+    ephemeral: true
+  });
+}
 
     // Premium: must be whole hours (input is already in hours, just needs to be ≥ 1)
     if (num === 2 && hoursEntered < 1) {
@@ -1735,7 +1736,7 @@ client.on('interactionCreate', async interaction => {
     try {
       const username = interaction.user.username;
       // For Premium: hours = hoursEntered (whole number). For others: hours = credits / creditsPerHour.
-      const hours    = num === 2 ? hoursEntered : creditsToHours(num, creditsToSpend);
+      const hours = hoursEntered; // always whole hours now for both plans
       const { key, expiry, identifier } = await createLuarmorKey(hours, userId, username, project);
  
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
