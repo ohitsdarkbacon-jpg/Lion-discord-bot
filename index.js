@@ -533,24 +533,30 @@ function generatePanelEmbed() {
     )
     .addFields(
       {
-  name: '🔵 Basic Plan',
-  value: [
-    `> 💰 **1 credit = 2 hours** (0.5cr per hour)`,
-    `> ⏱️  Minimum purchase: **1 credit (2h)** — whole hours only`,
-    `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
-    `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
-  ].join('\n'),
-  inline: true
-},
-{
-  name: '🟣 Premium Plan',
-  value: [
-    `> 💰 **2 credits = 1 hour**`,
-    `> ⏱️  Minimum purchase: **2 credits (1h)** — whole hours only`,
-    `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
-    `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
-  ].join('\n'),
-  inline: true
+        name: '🔵 Basic Plan',
+        value: [
+          `> 💰 **1 credit = 2 hours** (0.5cr per hour)`,
+          `> ⏱️  Minimum purchase: **1 credit (2h)** — whole hours only`,
+          `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
+          `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+        ].join('\n'),
+        inline: true
+      },
+      {
+        name: '🟣 Premium Plan',
+        value: [
+          `> 💰 **2 credits = 1 hour**`,
+          `> ⏱️  Minimum purchase: **2 credits (1h)** — whole hours only`,
+          `> 🎰 Slots: **${premiumActive}/${PROJECTS[2].maxSlots}** ${slotStatusBadge(premiumActive, PROJECTS[2].maxSlots)}`,
+          `> ${premiumActive >= PROJECTS[2].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
+        ].join('\n'),
+        inline: true
+      }
+    )
+    .setFooter({ text: paused ? '⏸️  SYSTEM PAUSED  •  Lion Notifier' : 'Use the buttons below to activate a slot or top up credits  •  Lion Notifier' })
+    .setTimestamp();
+
+  return embed;
 }
  
 // ===== SLOTS EMBED =====
