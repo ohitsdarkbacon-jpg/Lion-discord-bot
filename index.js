@@ -31,6 +31,8 @@ const PANEL_STATE_FILE    = './panel_state.json';
 const PAYMENTS_FILE       = './payments.json';
 const CREDITS_BACKUP_FILE = './credits_backup.json';
 const PAUSE_STATE_FILE    = './pause_state.json';
+// NEW: Roblox <-> Discord link storage
+const LINKS_FILE          = './roblox_links.json';
  
 let users      = fs.existsSync(USERS_FILE)       ? JSON.parse(fs.readFileSync(USERS_FILE))       : {};
 let slots      = fs.existsSync(SLOTS_FILE)       ? JSON.parse(fs.readFileSync(SLOTS_FILE))       : [];
@@ -38,17 +40,19 @@ let auctions   = fs.existsSync(AUCTIONS_FILE)    ? JSON.parse(fs.readFileSync(AU
 let panelState = fs.existsSync(PANEL_STATE_FILE) ? JSON.parse(fs.readFileSync(PANEL_STATE_FILE)) : {};
 let payments   = fs.existsSync(PAYMENTS_FILE)    ? JSON.parse(fs.readFileSync(PAYMENTS_FILE))    : {};
 let pauseState = fs.existsSync(PAUSE_STATE_FILE) ? JSON.parse(fs.readFileSync(PAUSE_STATE_FILE)) : { paused: false, pausedAt: null };
+// NEW: links[robloxName] = [ { discordId, discordTag, linkedAt } ]
+let links      = fs.existsSync(LINKS_FILE)       ? JSON.parse(fs.readFileSync(LINKS_FILE))       : {};
  
 // ===== PROJECT CONFIG =====
-// Basic:   1 credit  = 1 hour,  minimum 3 credits  (= 3 hours)
-// Premium: 3 credits = 1 hour,  minimum 3 credits  (= 1 hour), must be purchased in multiples of 3 (whole hours only)
+// Basic:   0.5 credits = 1 hour, minimum 1 credit  (= 2 hours)
+// Premium: 2 credits   = 1 hour, minimum 2 credits (= 1 hour), whole hours only
 const PROJECTS = {
   1: { id: process.env.LUARMOR_PROJECT_ID_1, name: 'Basic',   creditsPerHour: 0.5, minCredits: 1, creditStep: 1, maxSlots: 12, apiKey: process.env.LUARMOR_API_KEY },
   2: { id: process.env.LUARMOR_PROJECT_ID_2, name: 'Premium', creditsPerHour: 2,   minCredits: 2, creditStep: 2, maxSlots: 6,  apiKey: process.env.LUARMOR_API_KEY },
-  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
-  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1, minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  3: { id: process.env.LUARMOR_PROJECT_ID_3, name: 'Farmer',  creditsPerHour: 1,   minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
+  4: { id: process.env.LUARMOR_PROJECT_ID_4, name: 'Main',    creditsPerHour: 1,   minCredits: 1, creditStep: 1, maxSlots: 2,  apiKey: process.env.LUARMOR_API_KEY },
 };
-
+ 
 function creditsToHours(projectNum, credits) {
   return credits / PROJECTS[projectNum].creditsPerHour;
 }
@@ -58,7 +62,7 @@ const BID_SLOTS             = 2;
 const AUCTION_DURATION_MINS = 5;
 const AUCTION_FIXED_HOURS   = 2;
 const AUCTION_COOLDOWN_MS   = AUCTION_FIXED_HOURS * 60 * 60 * 1000;
-
+ 
 // Minimum bids per auction project
 const AUCTION_MIN_BID = {
   3: 2,  // Farmer: minimum 2 credits
@@ -79,6 +83,8 @@ function saveAuctions()   { fs.writeFileSync(AUCTIONS_FILE,    JSON.stringify(au
 function savePanelState() { fs.writeFileSync(PANEL_STATE_FILE, JSON.stringify(panelState, null, 2)); }
 function savePayments()   { fs.writeFileSync(PAYMENTS_FILE,    JSON.stringify(payments,   null, 2)); }
 function savePauseState() { fs.writeFileSync(PAUSE_STATE_FILE, JSON.stringify(pauseState, null, 2)); }
+// NEW
+function saveLinks()      { fs.writeFileSync(LINKS_FILE,       JSON.stringify(links,      null, 2)); }
  
 function saveCreditsBackup() {
   const backup = {};
@@ -90,6 +96,21 @@ function saveCreditsBackup() {
 function loadCreditsBackup() {
   if (!fs.existsSync(CREDITS_BACKUP_FILE)) return null;
   return JSON.parse(fs.readFileSync(CREDITS_BACKUP_FILE));
+}
+ 
+// ===== LINK HELPERS =====
+// Called by the Lua script via a webhook endpoint: POST /link-account { robloxName, discordName, discordId? }
+function recordLink(robloxName, discordTag, discordId) {
+  const robloxKey = robloxName.toLowerCase();
+  if (!links[robloxKey]) links[robloxKey] = [];
+ 
+  // Check if this discord tag is already linked
+  const exists = links[robloxKey].find(l => l.discordTag === discordTag);
+  if (!exists) {
+    links[robloxKey].push({ discordTag, discordId: discordId || null, linkedAt: Date.now() });
+    saveLinks();
+    console.log(`🔗 New link: Roblox "${robloxName}" → Discord "${discordTag}"`);
+  }
 }
  
 // ===== COMMANDS =====
@@ -136,6 +157,19 @@ const commands = [
     .addAttachmentOption(opt =>
       opt.setName('file').setDescription('The exported credits JSON file').setRequired(true)
     ),
+  // NEW: /search — look up all Roblox accounts linked to a Discord tag
+  new SlashCommandBuilder()
+    .setName('search')
+    .setDescription('(Admin) Search all Roblox accounts linked to a Discord user')
+    .addUserOption(opt =>
+      opt.setName('user').setDescription('Discord user to search').setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('roblox').setDescription('Roblox username to search').setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('discord_tag').setDescription('Discord tag (username) to search').setRequired(false)
+    ),
 ].map(c => c.toJSON());
  
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -158,10 +192,10 @@ function ensureUser(userId) {
   if (!users[userId]) users[userId] = { credits: 0, processed: [] };
   if (!Array.isArray(users[userId].processed)) users[userId].processed = [];
 }
-
+ 
 // ===== PAUSE HELPERS =====
 function isSystemPaused() { return !!pauseState.paused; }
-
+ 
 async function pauseSystem() {
   if (pauseState.paused) return false;
   pauseState.paused   = true;
@@ -170,7 +204,7 @@ async function pauseSystem() {
   console.log(`⏸️  System paused at ${new Date().toISOString()}`);
   return true;
 }
-
+ 
 async function unpauseSystem() {
   if (!pauseState.paused) return { success: false };
   const pausedDuration = Date.now() - pauseState.pausedAt;
@@ -179,7 +213,7 @@ async function unpauseSystem() {
   pauseState.pausedAt = null;
   savePauseState();
   console.log(`▶️  System unpaused — paused for ${formatTime(pausedDuration)}`);
-
+ 
   // Extend all active slots by the paused duration
   let extended = 0;
   for (const slot of slots) {
@@ -257,7 +291,7 @@ function isAuctionSlotOnCooldown(projectNum, slotIndex) {
 async function generateQRBuffer(text) {
   return QRCode.toBuffer(text, { type: 'png', width: 200, margin: 2 });
 }
-
+ 
 // ===== STATUS BADGE HELPERS =====
 function slotStatusBadge(active, max) {
   const pct = active / max;
@@ -436,27 +470,53 @@ async function pollPendingPayments() {
 // ===== WEBHOOK HTTP SERVER =====
 function startWebhookServer() {
   const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || !req.url.startsWith('/nowpayments-webhook')) {
-      res.writeHead(404);
-      return res.end('Not found');
+    // ── NowPayments IPN ──────────────────────────────────────
+    if (req.method === 'POST' && req.url.startsWith('/nowpayments-webhook')) {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+ 
+        const body = Buffer.concat(chunks).toString('utf8');
+        processWebhookBody(body, req.headers).catch(err => {
+          console.error('❌ processWebhookBody error:', err.message);
+        });
+      });
+      return;
     }
  
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+    // ── NEW: Roblox account link endpoint ────────────────────
+    // POST /link-account   { robloxName, discordTag, discordId? }
+    if (req.method === 'POST' && req.url === '/link-account') {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        let payload;
+        try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {
+          res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: 'bad json' }));
+        }
  
-      const body = Buffer.concat(chunks).toString('utf8');
-      processWebhookBody(body, req.headers).catch(err => {
-        console.error('❌ processWebhookBody error:', err.message);
+        const { robloxName, discordTag, discordId } = payload || {};
+        if (!robloxName || !discordTag) {
+          res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: 'missing fields' }));
+        }
+ 
+        recordLink(String(robloxName).trim(), String(discordTag).trim(), discordId ? String(discordId).trim() : null);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
       });
-    });
+      return;
+    }
+ 
+    res.writeHead(404);
+    res.end('Not found');
   });
  
   server.listen(WEBHOOK_PORT, () => {
     console.log(`🌐 Webhook server on port ${WEBHOOK_PORT}`);
     console.log(`   IPN URL → ${WEBHOOK_BASE_URL}/nowpayments-webhook`);
+    console.log(`   Link URL → ${WEBHOOK_BASE_URL}/link-account`);
   });
 }
  
@@ -521,7 +581,7 @@ function generatePanelEmbed() {
   const basicActive   = getActiveSlots(1);
   const premiumActive = getActiveSlots(2);
   const paused = isSystemPaused();
-
+ 
   const embed = new EmbedBuilder()
     .setTitle('🦁 Lion Notifier — Slot Panel')
     .setColor(paused ? 0xED4245 : 0xF5C542)
@@ -535,7 +595,7 @@ function generatePanelEmbed() {
       {
         name: '🔵 Basic Plan',
         value: [
-          `> 💰 **1 credit = 2 hours** (0.5cr per hour)`,
+          `> 💰 **0.5 credits = 1 hour** (1 credit = 2 hours)`,
           `> ⏱️  Minimum purchase: **1 credit (2h)** — whole hours only`,
           `> 🎰 Slots: **${basicActive}/${PROJECTS[1].maxSlots}** ${slotStatusBadge(basicActive, PROJECTS[1].maxSlots)}`,
           `> ${basicActive >= PROJECTS[1].maxSlots ? '🔴 **Full** — check back soon' : '🟢 **Available**'}`,
@@ -555,7 +615,7 @@ function generatePanelEmbed() {
     )
     .setFooter({ text: paused ? '⏸️  SYSTEM PAUSED  •  Lion Notifier' : 'Use the buttons below to activate a slot or top up credits  •  Lion Notifier' })
     .setTimestamp();
-
+ 
   return embed;
 }
  
@@ -567,11 +627,11 @@ function generateSlotsEmbed() {
     .setTitle('📊 Live Slot Overview')
     .setColor(paused ? 0x99AAB5 : 0x5865F2)
     .setTimestamp();
-
+ 
   if (paused) {
     embed.setDescription('⏸️  **Countdowns are frozen** — all expiry times are extended when the system unpauses.');
   }
-
+ 
   for (const [num, proj] of Object.entries(PROJECTS)) {
     if (AUCTION_PROJECTS.includes(Number(num))) continue;
     const active = slots.filter(s => s?.projectNum === Number(num) && s.expiry > now);
@@ -607,7 +667,7 @@ function generateAuctionSectionEmbed() {
     const proj = PROJECTS[num];
     const icon = num === 3 ? '🌾' : '⚔️';
     const minBid = AUCTION_MIN_BID[num];
-
+ 
     for (let i = 1; i <= BID_SLOTS; i++) {
       const aId     = getAuctionId(num, i);
       const auction = auctions[aId];
@@ -1129,7 +1189,7 @@ client.on('interactionCreate', async interaction => {
       ephemeral: true
     });
   }
-
+ 
   // ===== PAUSE =====
   if (interaction.commandName === 'pause' && isAdmin) {
     if (isSystemPaused()) {
@@ -1165,7 +1225,7 @@ client.on('interactionCreate', async interaction => {
       ephemeral: false
     });
   }
-
+ 
   // ===== UNPAUSE =====
   if (interaction.commandName === 'unpause' && isAdmin) {
     if (!isSystemPaused()) {
@@ -1199,25 +1259,23 @@ client.on('interactionCreate', async interaction => {
       ]
     });
   }
-
+ 
   // ===== EXPORT CREDITS =====
-  // Generates a clean JSON file: { "userId": credits, ... } and sends it as an attachment.
   if (interaction.commandName === 'exportcredits' && isAdmin) {
     await interaction.deferReply({ ephemeral: true });
-
-    // Build the export object — userId → credits only (clean, importable format)
+ 
     const exportData = {};
     for (const [userId, data] of Object.entries(users)) {
       exportData[userId] = data.credits || 0;
     }
-
+ 
     const userCount  = Object.keys(exportData).length;
     const totalCreds = Object.values(exportData).reduce((a, b) => a + b, 0);
     const timestamp  = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const fileName   = `lion_credits_export_${timestamp}.json`;
     const fileBuffer = Buffer.from(JSON.stringify(exportData, null, 2), 'utf8');
     const attachment = new AttachmentBuilder(fileBuffer, { name: fileName });
-
+ 
     return interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -1238,15 +1296,13 @@ client.on('interactionCreate', async interaction => {
       files: [attachment]
     });
   }
-
+ 
   // ===== IMPORT CREDITS =====
-  // Accepts the exported JSON file, validates it, and sets each user's credits accordingly.
   if (interaction.commandName === 'importcredits' && isAdmin) {
     await interaction.deferReply({ ephemeral: true });
-
+ 
     const attachment = interaction.options.getAttachment('file');
-
-    // Basic validation — must be a JSON file
+ 
     if (!attachment.name.endsWith('.json')) {
       return interaction.editReply({
         embeds: [
@@ -1258,8 +1314,7 @@ client.on('interactionCreate', async interaction => {
         ]
       });
     }
-
-    // Fetch the file content from Discord's CDN
+ 
     let rawText;
     try {
       const resp = await axios.get(attachment.url, { responseType: 'text' });
@@ -1275,8 +1330,7 @@ client.on('interactionCreate', async interaction => {
         ]
       });
     }
-
-    // Parse JSON
+ 
     let importData;
     try {
       importData = typeof rawText === 'string' ? JSON.parse(rawText) : rawText;
@@ -1291,8 +1345,7 @@ client.on('interactionCreate', async interaction => {
         ]
       });
     }
-
-    // Validate structure — must be a flat object of { userId: number }
+ 
     if (typeof importData !== 'object' || Array.isArray(importData)) {
       return interaction.editReply({
         embeds: [
@@ -1304,26 +1357,25 @@ client.on('interactionCreate', async interaction => {
         ]
       });
     }
-
+ 
     let imported = 0;
     let skipped  = 0;
-
+ 
     for (const [userId, credits] of Object.entries(importData)) {
-      // Skip entries with non-numeric or negative credits
       if (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0) {
         skipped++;
         continue;
       }
       ensureUser(userId);
-      users[userId].credits = Math.floor(credits); // floor just in case of floats
+      users[userId].credits = Math.floor(credits);
       imported++;
     }
-
+ 
     saveUsers();
     saveCreditsBackup();
-
+ 
     console.log(`📥 Credits imported: ${imported} users updated, ${skipped} skipped`);
-
+ 
     return interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -1341,6 +1393,113 @@ client.on('interactionCreate', async interaction => {
           .setTimestamp()
       ]
     });
+  }
+ 
+  // ===== NEW: /search =====
+  // Search all Roblox accounts linked to a Discord user, or look up a Roblox name to find all linked discords.
+  if (interaction.commandName === 'search' && isAdmin) {
+    const targetUser = interaction.options.getUser('user');
+    const robloxQuery = (interaction.options.getString('roblox') || '').trim().toLowerCase();
+    const discordTagQuery = (interaction.options.getString('discord_tag') || '').trim().toLowerCase();
+ 
+    // Must supply at least one search param
+    if (!targetUser && !robloxQuery && !discordTagQuery) {
+      return interaction.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle('❌ No Search Term')
+            .setColor(0xED4245)
+            .setDescription('Provide at least one of: `user`, `roblox`, or `discord_tag`.')
+            .setFooter({ text: 'Lion Notifier Admin' })
+        ],
+        ephemeral: true
+      });
+    }
+ 
+    await interaction.deferReply({ ephemeral: true });
+ 
+    const embed = new EmbedBuilder()
+      .setTitle('🔍 Account Search Results')
+      .setColor(0x5865F2)
+      .setFooter({ text: 'Lion Notifier Admin  •  Account Linking' })
+      .setTimestamp();
+ 
+    // ── Mode 1: Search by Discord user/tag — find all Roblox names they've used ──
+    if (targetUser || discordTagQuery) {
+      const searchId  = targetUser?.id  || null;
+      const searchTag = targetUser?.username?.toLowerCase() || discordTagQuery;
+ 
+      const matches = []; // { robloxName, linkedAt }
+ 
+      for (const [robloxKey, entries] of Object.entries(links)) {
+        for (const entry of entries) {
+          const tagMatch  = entry.discordTag?.toLowerCase() === searchTag;
+          const idMatch   = searchId && entry.discordId === searchId;
+          if (tagMatch || idMatch) {
+            matches.push({ robloxName: robloxKey, discordTag: entry.discordTag, linkedAt: entry.linkedAt });
+          }
+        }
+      }
+ 
+      if (matches.length === 0) {
+        embed.setDescription(`No Roblox accounts found linked to **${targetUser?.tag || discordTagQuery}**.`);
+      } else {
+        embed.setDescription(
+          `Found **${matches.length}** Roblox account${matches.length !== 1 ? 's' : ''} linked to ` +
+          `**${targetUser?.tag || discordTagQuery}**:`
+        );
+        // Chunk into one field (Discord field value max 1024 chars)
+        const lines = matches.map(m =>
+          `• \`${m.robloxName}\` — <t:${Math.floor((m.linkedAt || 0) / 1000)}:D>`
+        );
+        // Split into multiple fields if needed
+        const chunks = [];
+        let current  = '';
+        for (const line of lines) {
+          if ((current + line + '\n').length > 1000) { chunks.push(current.trimEnd()); current = ''; }
+          current += line + '\n';
+        }
+        if (current) chunks.push(current.trimEnd());
+        chunks.forEach((c, i) => embed.addFields({
+          name: i === 0 ? '🎮 Roblox Accounts' : '\u200b',
+          value: c,
+          inline: false
+        }));
+      }
+ 
+      return interaction.editReply({ embeds: [embed] });
+    }
+ 
+    // ── Mode 2: Search by Roblox name — find all Discord accounts that logged in under it ──
+    if (robloxQuery) {
+      // Search partial match too
+      const matchedKeys = Object.keys(links).filter(k => k.includes(robloxQuery));
+ 
+      if (matchedKeys.length === 0) {
+        embed.setDescription(`No Discord accounts found linked to Roblox name matching **"${robloxQuery}"**.`);
+        return interaction.editReply({ embeds: [embed] });
+      }
+ 
+      embed.setDescription(`Found **${matchedKeys.length}** Roblox username${matchedKeys.length !== 1 ? 's' : ''} matching **"${robloxQuery}"**:`);
+ 
+      for (const robloxKey of matchedKeys.slice(0, 15)) { // cap at 15 roblox names to avoid embed limits
+        const entries = links[robloxKey];
+        const lines   = entries.map(e =>
+          `• \`${e.discordTag || 'unknown'}\`${e.discordId ? ` (<@${e.discordId}>)` : ''} — <t:${Math.floor((e.linkedAt || 0) / 1000)}:D>`
+        );
+        embed.addFields({
+          name:  `🎮 ${robloxKey}`,
+          value: lines.join('\n').slice(0, 1024) || '—',
+          inline: false
+        });
+      }
+ 
+      if (matchedKeys.length > 15) {
+        embed.addFields({ name: '⚠️ Truncated', value: `Only showing first 15 of ${matchedKeys.length} results. Narrow your search.`, inline: false });
+      }
+ 
+      return interaction.editReply({ embeds: [embed] });
+    }
   }
 });
  
@@ -1392,7 +1551,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
-
+ 
     const num         = interaction.customId === 'select_project_1' ? 1 : 2;
     const project     = PROJECTS[num];
     const userCredits = users[userId].credits;
@@ -1425,6 +1584,7 @@ client.on('interactionCreate', async interaction => {
       });
     }
  
+    // BUG FIX: Modal label and placeholder corrected for both plans (both now take hours as input)
     const modal = new ModalBuilder()
       .setCustomId(`activate_modal_${num}`)
       .setTitle(`Activate ${project.name} Slot`);
@@ -1434,14 +1594,14 @@ client.on('interactionCreate', async interaction => {
           .setCustomId('credits_amount')
           .setLabel(
             num === 2
-              ? `Hours to buy (min 1h = 3cr, have ${userCredits}cr)`
-              : `Credits to spend (min ${project.minCredits}, have ${userCredits})`
+              ? `Hours to buy (min 1h = 2cr, have ${userCredits}cr)`
+              : `Hours to buy (min 1h = 0.5cr, have ${userCredits}cr)`
           )
           .setStyle(TextInputStyle.Short)
           .setPlaceholder(
             num === 1
-              ? `e.g. 3 = 3h, 5 = 5h, 10 = 10h`
-              : `e.g. 1 = 3cr, 2 = 6cr, 3 = 9cr (whole hours)`
+              ? `e.g. 2 = 1cr, 4 = 2cr, 10 = 5cr`
+              : `e.g. 1 = 2cr, 2 = 4cr, 5 = 10cr`
           )
           .setRequired(true)
       )
@@ -1462,7 +1622,7 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
-
+ 
     const auctionId = interaction.customId.replace('place_bid_', '');
     const parts     = auctionId.split('_');
     const projNum   = parseInt(parts[1]);
@@ -1647,54 +1807,36 @@ client.on('interactionCreate', async interaction => {
         ephemeral: true
       });
     }
-
-    const num     = parseInt(interaction.customId.split('_')[2]);
-    const project = PROJECTS[num];
-    const rawInput = parseInt(interaction.fields.getTextInputValue('credits_amount'));
+ 
+    const num        = parseInt(interaction.customId.split('_')[2]);
+    const project    = PROJECTS[num];
+    const rawInput   = parseInt(interaction.fields.getTextInputValue('credits_amount'));
     const userCredits = users[userId].credits;
-
-    // For Premium (project 2) the user enters HOURS; convert to credits.
-    // For all others, the user enters CREDITS directly.
-   // Replace the num === 2 branch with this — both plans now take hours as input
-let creditsToSpend;
-let hoursEntered = rawInput; // both plans now input hours
-
-if (num === 2) {
-  creditsToSpend = hoursEntered * 2;   // 2 credits per hour
-} else {
-  creditsToSpend = hoursEntered * 0.5; // 0.5 credits per hour
-}
-
-// Minimum check for both — 1 whole hour minimum
-if (hoursEntered < 1) {
-  return interaction.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setTitle('❌ Below Minimum')
-        .setColor(0xED4245)
-        .setDescription(`Minimum is **1 hour**.\nYou entered **${hoursEntered}h**.`)
-        .setFooter({ text: 'Lion Notifier' })
-    ],
-    ephemeral: true
-  });
-}
-
-    // Premium: must be whole hours (input is already in hours, just needs to be ≥ 1)
-    if (num === 2 && hoursEntered < 1) {
+ 
+    // Both plans accept whole HOURS as input.
+    const hoursEntered = rawInput;
+ 
+    // BUG FIX: validate hours is a positive integer first
+    if (isNaN(hoursEntered) || hoursEntered < 1) {
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
-            .setTitle('❌ Below Minimum')
+            .setTitle('❌ Invalid Input')
             .setColor(0xED4245)
-            .setDescription(`**Premium** minimum is **1 hour** (= 3 credits).\nYou entered **${hoursEntered}h**.`)
+            .setDescription(`Please enter a whole number of hours (minimum **1 hour**).\nYou entered: **${rawInput}**`)
             .setFooter({ text: 'Lion Notifier' })
         ],
         ephemeral: true
       });
     }
-
-    // Basic: minimum credits check
-    if (num !== 2 && creditsToSpend < project.minCredits) {
+ 
+    // Calculate credits to spend based on project rate
+    // Basic: 0.5 credits/hour → 2h = 1cr, 4h = 2cr, etc.
+    // Premium: 2 credits/hour → 1h = 2cr, 2h = 4cr, etc.
+    const creditsToSpend = hoursEntered * project.creditsPerHour;
+ 
+    // BUG FIX: validate the calculated credits cover the minimum
+    if (creditsToSpend < project.minCredits) {
       return interaction.reply({
         embeds: [
           new EmbedBuilder()
@@ -1702,14 +1844,14 @@ if (hoursEntered < 1) {
             .setColor(0xED4245)
             .setDescription(
               `The minimum for **${project.name}** is **${project.minCredits} credit${project.minCredits !== 1 ? 's' : ''}**.\n` +
-              `You entered **${creditsToSpend}**.`
+              `**${hoursEntered}h** only costs **${creditsToSpend} credit${creditsToSpend !== 1 ? 's' : ''}**.`
             )
             .setFooter({ text: 'Lion Notifier' })
         ],
         ephemeral: true
       });
     }
-
+ 
     if (creditsToSpend > userCredits) {
       return interaction.reply({
         embeds: [
@@ -1717,15 +1859,14 @@ if (hoursEntered < 1) {
             .setTitle('❌ Insufficient Credits')
             .setColor(0xED4245)
             .setDescription(
-              num === 2
-                ? `**${hoursEntered}h** costs **${creditsToSpend} credits** but you only have **${userCredits}**.`
-                : `You only have **${userCredits} credits** but tried to spend **${creditsToSpend}**.`
+              `**${hoursEntered}h** costs **${creditsToSpend} credits** but you only have **${userCredits} credits**.\n\nUse **💳 Buy Credits** to top up.`
             )
             .setFooter({ text: 'Lion Notifier' })
         ],
         ephemeral: true
       });
     }
+ 
     if (getActiveSlots(num) >= project.maxSlots) {
       return interaction.reply({
         embeds: [
@@ -1741,8 +1882,7 @@ if (hoursEntered < 1) {
  
     try {
       const username = interaction.user.username;
-      // For Premium: hours = hoursEntered (whole number). For others: hours = credits / creditsPerHour.
-      const hours = hoursEntered; // always whole hours now for both plans
+      const hours    = hoursEntered;
       const { key, expiry, identifier } = await createLuarmorKey(hours, userId, username, project);
  
       slots = slots.filter(s => !(s.userId === userId && s.projectNum === num));
@@ -1752,8 +1892,8 @@ if (hoursEntered < 1) {
       saveSlots();
       saveCreditsBackup();
       updatePanelMessage();
-
-      const hoursDisplay = hours % 1 === 0 ? `${hours}h` : `${Math.floor(hours)}h ${Math.round((hours % 1) * 60)}m`;
+ 
+      const hoursDisplay = `${hoursEntered}h`;
  
       return interaction.reply({
         embeds: [
@@ -1799,7 +1939,7 @@ if (hoursEntered < 1) {
         ephemeral: true
       });
     }
-
+ 
     const auctionId = interaction.customId.replace('bid_modal_', '');
     const parts     = auctionId.split('_');
     const projNum   = parseInt(parts[1]);
@@ -1930,7 +2070,7 @@ if (hoursEntered < 1) {
 // ===== INTERVALS =====
  
 setInterval(() => {
-  if (isSystemPaused()) return; // don't clean slots while paused
+  if (isSystemPaused()) return;
   const before = slots.length;
   slots = slots.filter(s => s && s.expiry > Date.now());
   if (slots.length !== before) { saveSlots(); console.log(`🧹 Cleaned ${before - slots.length} expired slot(s)`); }
@@ -1957,7 +2097,6 @@ client.once('ready', async () => {
  
   for (const num of AUCTION_PROJECTS) for (let i = 1; i <= BID_SLOTS; i++) ensureAuction(num, i);
  
-  // Resume live auctions
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (auction.status !== 'live') continue;
     const remaining = auction.endsAt - Date.now();
@@ -1969,7 +2108,6 @@ client.once('ready', async () => {
     }
   }
  
-  // Resume cooldown timers
   for (const [auctionId, auction] of Object.entries(auctions)) {
     if (!auction.cooldownUntil || auction.cooldownUntil <= Date.now()) {
       if (auction.cooldownUntil && auction.cooldownUntil <= Date.now() && auction.status !== 'idle') {
@@ -2020,3 +2158,4 @@ client.once('ready', async () => {
 });
  
 client.login(process.env.BOT_TOKEN);
+
